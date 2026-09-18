@@ -1,0 +1,14 @@
+﻿[package]
+name = "logipeek"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Lightweight Windows Logitech HID++ diagnostics"
+repository = "https://github.com/1TcC/LogiPeek"
+
+[dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+
+[profile.release]
+lto = "thin"
+strip = true
