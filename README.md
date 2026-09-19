@@ -35,6 +35,8 @@ LogiPeek can see several interfaces for one physical device and deliberately doe
 
 A Windows USB receiver observation verified enumeration, protocol probing, dynamic feature detection, `0x1004 v3` battery reads, and one complete `0x2201 v2` DPI read for one `046D:C547` setup. Once slot `0x01` was online, five consecutive battery runs succeeded at 42%, Good, rechargeable, and discharging; the unresolved external-power indicator was raw `0x00`. The DPI response reported one sensor, current DPI 1300, default DPI 800, and a 100–25600 range in steps of 50. Other runs still timed out during slot probing, so endpoint availability remains intermittent. This did not identify the mouse model or establish support for every receiver. Bluetooth, direct USB mice, and other receiver families or connection methods remain unverified.
 
+Runtime `0x2201` DPI writing was physically verified on the same setup while `logi_lamparray_service` was running. A fresh read reported 1300 DPI; one at-most-once function 3 request changed it to the adjacent supported value 1350, and both the immediate safe readback and an independent `--dpi` process confirmed 1350. A second at-most-once request restored 1300, again confirmed immediately and independently. Both setter acknowledgements timed out, so the confirmation came from readback rather than an ACK; neither command retried function 3. This observation does not establish compatibility with all Logitech devices.
+
 HID++ is shared transport traffic. Replies can be stale or belong to another application; rotating software IDs reduces collisions but does not make them exclusive. Close Logitech software and retry if diagnostics are inconsistent.
 
 ## Build

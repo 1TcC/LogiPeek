@@ -127,4 +127,14 @@ A `logi_lamparray_service` process was present, but no G HUB application process
 
 On 2026-09-19, the final Phase 3 read-only preflight again enumerated the `046D:C547` receiver. Usage 1 exposed only the HID++ 1.x endpoint at `0xFF`; usage 2 had no responding endpoint, so the fresh `--dpi` command could not obtain a current value, supported representation, or step. The required preflight therefore did not authorize `--set-dpi`: no function 3 request was sent, no physical DPI change was claimed, and no restore was necessary. `logi_lamparray_service` remained present throughout this observation and was not stopped, killed, or reconfigured.
 
+### Phase 3.5 hardware validation
+
+On 2026-09-19, a later low-frequency validation run reached slot `0x01` on the same `046D:C547` receiver immediately. The fresh `--dpi` result reported HID++ 4.2, `0x2201 v2`, one sensor, current DPI 1300, default DPI 800, and the range 100–25600 in steps of 50. The adjacent test value was therefore calculated as 1350 rather than hardcoded before the read.
+
+One `--set-dpi 1350` invocation completed its fresh preflight and sent function 3 exactly once. The setter acknowledgement timed out; it was not retried. Its safe function 2 readback reported 1350, classifying the result as timeout but confirmed. A separate `--dpi` process then independently reported 1350.
+
+One `--set-dpi 1300` invocation subsequently completed a new preflight and sent function 3 exactly once to restore the original value. Its acknowledgement also timed out and was not retried; immediate function 2 readback reported 1300. A final independent `--dpi` process confirmed 1300. The full observed transition was therefore 1300 → 1350 → 1300, with two total function 3 requests across two explicit commands and no automatic setter retry.
+
+`logi_lamparray_service` remained running throughout the validation and was not stopped or modified. The successful runtime changes show that the service was not an inevitable blocker in this run; they do not rule out intermittent contention. A final `--battery` read also reached slot `0x01` and reported `0x1004 v3`, 41%, Good, rechargeable, discharging, and raw external-power indicator `0x00`. This is one receiver observation and does not establish write compatibility with other devices, receivers, or connection methods.
+
 Software ID rotation is not exclusive: input can be stale and other software can concurrently send HID++ traffic. IDs are four bits and repeat after 15 requests, which is a protocol-space limitation. Disconnects, sleep, permissions, malformed data, unsupported features, and timeouts become explicit errors. The hardware observation above validates one Windows USB receiver setup only; Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
