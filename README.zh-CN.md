@@ -12,9 +12,9 @@ LogiPeek 是一个小型、非官方的 Windows 命令行工具，用于查看 L
 
 ## 状态与目标
 
-项目仍处于早期的第一阶段。它枚举 Logitech HID 接口，识别部分 HID++ 响应，并且只显示设备实际返回的能力信息。目标是以精简的 Rust 实现提供明确的失败信息、可安全分享的诊断输出和无后台活动的工具。已于 2026-09-19 在 Windows 上实测一个接收器配置；详见 [实机观察](docs/hidpp.md#hardware-observation)。它不承诺支持具体鼠标型号或广泛的接收器兼容性。
+项目仍处于早期的只读基础阶段。它枚举 Logitech HID 接口，识别部分 HID++ 响应，并且只显示设备实际返回的信息。目标是以精简的 Rust 实现提供明确的失败信息、可安全分享的诊断输出和无后台活动的工具。已于 2026-09-19 在 Windows 上实测一个接收器配置；详见 [实机观察](docs/hidpp.md#baseline-hardware-observation)。它不承诺支持具体鼠标型号或广泛的接收器兼容性。该配置已成功完成一次真实 `0x1004` 电池读取；由于转发槽位响应不稳定，真实设备 DPI 完整读取仍未验证。
 
-LogiPeek 通过 HID++ 能力探测机制，目标是尽可能兼容不同型号的 Logitech 鼠标。17 项协议测试、`cargo fmt --check`、`cargo check`、`cargo clippy --all-targets --all-features -- -D warnings` 和 release build 均于 2026-09-19 通过。
+LogiPeek 通过 HID++ 能力探测机制，目标是尽可能兼容不同型号的 Logitech 鼠标。25 项协议测试、`cargo fmt --check`、`cargo check`、`cargo clippy --all-targets --all-features -- -D warnings` 和 release build 均于 2026-09-19 通过。
 
 ## 当前功能
 
@@ -22,16 +22,16 @@ LogiPeek 通过 HID++ 能力探测机制，目标是尽可能兼容不同型号�
 - 仅把 usage page 为 `0xFF00` 且 usage 为 `1` 或 `2` 的接口视为 HID++ 查询候选。
 - 探测端点 `0xFF` 及槽位 `1` 到 `6`；这些槽位只是有界候选，并非接收器或已配对设备清单。
 - 识别 HID++ 2.x feature 协议，以及仅作识别的 HID++ 1.x；尚未实现 HID++ 1.x 寄存器功能。
-- 检测电池 feature ID `0x1000`、`0x1001`、`0x1004`，但只读取 `0x1000` version 0。
-- 只有当 `0x1000` capability flags 表示值为 mileage/percentage 时才显示精确百分比；否则映射为粗略电量等级，`0` 表示未知。
-- 检测 DPI feature ID `0x2201`、`0x2202`，不读取、推测或写入 DPI 数值。
-- 提供一次性运行的 `--devices`、`--diag` 和 `--battery` 命令。
+- 检测电池 feature ID `0x1000`、`0x1001`、`0x1004`。有 `0x1004` 时读取 Unified Battery，并保留 `0x1000` version 0 作为回退。
+- 在所选 feature 提供时，以只读方式报告电池百分比、粗略等级、充电状态、feature 版本和外部电源原始指示值；未知协议值会明确保留为未知。
+- 检测 DPI feature ID `0x2201`、`0x2202`。从 `0x2201` 读取传感器数量、当前 DPI、可选默认 DPI 及支持的数值或范围；绝不写入 DPI，也不扫描未知 function。
+- 提供一次性运行的 `--devices`、`--diag`、`--battery` 和 `--dpi` 命令。
 
 ## 兼容性与限制
 
 LogiPeek 可能将同一物理设备显示为多个接口，并且刻意不对其去重。`0xFF` 端点可能是直连设备或接收器端点；有响应的 `1–6` 槽位只是转发槽位候选。两者都不能确认接收器系列、配对关系或完整的已配对设备清单。
 
-已在 Windows 上对一个 `046D:C547` USB 接收器配置验证枚举、协议 probe 和动态 feature 检测；这不能识别鼠标型号，也不能证明支持所有接收器。该观察没有发现 `0x1000` v0 feature，因此 `--battery` 可正常完成但未读取真实电量；DPI 只验证 detection，未执行 DPI query 或 write。蓝牙、直连 USB 鼠标、其他接收器系列及其他连接方式仍未验证。
+已在 Windows 上对一个 `046D:C547` USB 接收器配置验证枚举、协议 probe、动态 feature 检测和一次 `0x1004 v3` 电池读取。设备返回 43%、正在放电，尚未解释的外部电源原始指示值为 `0x00`。其他尝试出现超时，且未取得完整 DPI 数值，因此连接稳定性和真实设备 DPI 解析仍未验证。这不能识别鼠标型号，也不能证明支持所有接收器。蓝牙、直连 USB 鼠标、其他接收器系列及其他连接方式仍未验证。
 
 HID++ 传输可能被其他软件同时使用。回复可能陈旧，或来自其他应用；轮换 software ID 可降低冲突，但并不独占。若诊断结果不一致，请关闭 Logitech 软件后重试。
 
@@ -53,6 +53,7 @@ cargo build --release
 cargo run -- --devices
 cargo run -- --diag
 cargo run -- --battery
+cargo run -- --dpi
 ```
 
 项目通过 `hidapi` 的 `windows-native` backend 访问 HID；运行时不需要网络。
@@ -62,7 +63,8 @@ cargo run -- --battery
 ```text
 logipeek --devices   # 候选接口与已发现能力
 logipeek --diag      # 可安全分享的接口/协议详情
-logipeek --battery   # 请求受支持的 0x1000 v0 电池数据
+logipeek --battery   # 读取受支持的 0x1004 电池数据，并回退到 0x1000 v0
+logipeek --dpi       # 读取受支持的 0x2201 DPI 数据
 logipeek --help
 ```
 
@@ -77,7 +79,7 @@ LogiPeek 没有账户、遥测、分析、上传、云端调用、后台服务�
 - 将验证范围从已观察的 Windows USB 接收器扩展到直连和蓝牙设备。
 - 仅在协议证据充分时改进设备与接收器的解释。
 - 为更多电池格式和 DPI 数据加入经过验证的读取。
-- 第一阶段不包含写入、预设、配置文件、RGB、宏、重映射、GUI/托盘、开机启动或更新。
+- 当前只读阶段不包含 DPI 写入、预设、配置文件、RGB、宏、重映射、GUI/托盘、后台服务、开机启动或更新。
 
 ## 贡献
 

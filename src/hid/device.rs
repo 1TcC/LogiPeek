@@ -16,6 +16,7 @@ pub struct Endpoint {
     pub protocol: Result<Protocol, Error>,
     pub features: Vec<FeatureResult>,
     pub battery: Option<Result<battery::Battery, Error>>,
+    pub dpi: Option<Result<Vec<dpi::SensorDpi>, Error>>,
 }
 #[derive(Debug)]
 pub struct Interface {
@@ -37,7 +38,13 @@ pub struct Interface {
 /// Slots are bounded probes, not claims about pairing or receiver type.
 pub const PROBE_INDICES: [u8; 7] = [0xff, 1, 2, 3, 4, 5, 6];
 
-pub fn scan(read_battery: bool) -> Result<Vec<Interface>, Error> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanOptions {
+    pub read_battery: bool,
+    pub read_dpi: bool,
+}
+
+pub fn scan(options: ScanOptions) -> Result<Vec<Interface>, Error> {
     let api = HidApi::new().map_err(|_| Error::Io)?;
     let mut interfaces = Vec::new();
     for info in api.device_list().filter(|d| d.vendor_id() == 0x046d) {
@@ -73,6 +80,7 @@ pub fn scan(read_battery: bool) -> Result<Vec<Interface>, Error> {
                             protocol,
                             features: Vec::new(),
                             battery: None,
+                            dpi: None,
                         };
                         if matches!(endpoint.protocol, Ok(Protocol::Feature { .. })) {
                             for id in battery::FEATURE_IDS.into_iter().chain(dpi::FEATURE_IDS) {
@@ -81,19 +89,37 @@ pub fn scan(read_battery: bool) -> Result<Vec<Interface>, Error> {
                                     result: hidpp::discover(&mut transport, index, id),
                                 });
                             }
-                            if read_battery {
-                                let feature =
-                                    endpoint.features.iter().find_map(|f| match &f.result {
-                                        Ok(Some(feature))
-                                            if feature.id == 0x1000 && feature.version == 0 =>
-                                        {
-                                            Some(*feature)
-                                        }
+                            if options.read_battery {
+                                let feature = endpoint
+                                    .features
+                                    .iter()
+                                    .find_map(|f| match &f.result {
+                                        Ok(Some(feature)) if feature.id == 0x1004 => Some(*feature),
                                         _ => None,
+                                    })
+                                    .or_else(|| {
+                                        endpoint.features.iter().find_map(|f| match &f.result {
+                                            Ok(Some(feature))
+                                                if feature.id == 0x1000 && feature.version == 0 =>
+                                            {
+                                                Some(*feature)
+                                            }
+                                            _ => None,
+                                        })
                                     });
                                 if let Some(feature) = feature {
                                     endpoint.battery =
                                         Some(battery::read(&mut transport, index, feature));
+                                }
+                            }
+                            if options.read_dpi {
+                                let feature =
+                                    endpoint.features.iter().find_map(|f| match &f.result {
+                                        Ok(Some(feature)) if feature.id == 0x2201 => Some(*feature),
+                                        _ => None,
+                                    });
+                                if let Some(feature) = feature {
+                                    endpoint.dpi = Some(dpi::read(&mut transport, index, feature));
                                 }
                             }
                         }

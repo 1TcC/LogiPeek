@@ -20,8 +20,8 @@
 - Do not copy GPL source into this MIT project. Prefer public Logitech protocol documentation and independent implementation.
 - Keep diagnostics safe to share: no usernames, home paths, serial numbers, MAC/IP addresses, or full HID paths.
 - Do not claim hardware compatibility or validation without actual physical testing. Clearly separate implemented features from verified behavior.
-- Avoid busy polling. Phase one is a one-shot CLI foundation.
-- Phase one excludes GUI, tray, DPI writes/presets, startup registration, auto updates, RGB, macros, remapping, and onboard profile changes.
+- Avoid busy polling. LogiPeek uses one-shot CLI queries.
+- The current phase excludes GUI, tray, DPI writes/presets, startup registration, auto updates, RGB, macros, remapping, and onboard profile changes.
 
 ## Collaboration
 - Use a small number of independent sub-agents where useful; do not delegate merely for the sake of delegation.
@@ -39,5 +39,5 @@
 - Review errors, public APIs, unwrap/expect, panic/todo/unimplemented, unsafe, TODO/FIXME, tests, dependencies, diagnostics, and all diffs before committing.
 - Maintain matching English and Simplified Chinese READMEs, truthful current architecture/protocol docs, and an MIT license.
 - Exclude build outputs, temporary files, secrets, and unrelated machine data from Git. Review staged content before committing.
-- The requested phase-one delivery branch is main at https://github.com/1TcC/LogiPeek.git. Commit/push only after development, review, and validation; if authentication fails, preserve the local commit without changing system authentication.
-- Stop after phase one. Report blockers and unrun checks honestly.
+- The requested delivery branch is main at https://github.com/1TcC/LogiPeek.git. Commit/push only after development, review, and validation; if authentication fails, preserve the local commit without changing system authentication.
+- Stop after the authorized phase. Report blockers and unrun checks honestly.

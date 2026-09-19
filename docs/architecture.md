@@ -11,8 +11,8 @@ CLI → discovery → transport → HID++ protocol → features → battery / DP
 - `hid::device` enumerates `hidapi` interfaces whose vendor ID is `0x046D`, sanitizes labels, opens only HID++ query candidates, attempts native report-descriptor reconstruction after a successful open, and retains every interface separately.
 - `hid::transport` performs serial HID++ exchanges over one opened interface, including Windows zero-padded input handling.
 - `hid::hidpp` strictly parses short (`0x10`, 7-byte) and long (`0x11`, 20-byte) protocol packets, classifies errors, probes HID++ versions, and discovers features.
-- `hid::features::battery` detects `0x1000`, `0x1001`, and `0x1004`, and implements only `0x1000` version 0 reads.
-- `hid::features::dpi` contains detection IDs `0x2201` and `0x2202`; no DPI operation calls are implemented.
+- `hid::features::battery` detects `0x1000`, `0x1001`, and `0x1004`. It reads `0x1004` capabilities/status and retains the `0x1000` version 0 reader as a fallback.
+- `hid::features::dpi` detects `0x2201` and `0x2202` and implements the read-only `0x2201` sensor count, supported-values, and current/default queries. It contains no write operation.
 
 ## Capability-first discovery
 
@@ -34,12 +34,12 @@ Software IDs are not exclusive. Another client can use the interface, and an app
 
 ## Battery semantics
 
-Feature discovery reports `0x1000`, `0x1001`, and `0x1004`. Only discovered `0x1000` version 0 is read: function 1 for capabilities, then function 0 for status. The parser requires sufficient data and validates its range. It shows `Percentage` only when capability flags say the level is mileage/percentage (capability byte 0 at least 10 and flag bit 1 set). Other nonzero values become coarse Critical/Low/Good/Full levels; zero is Unknown. `0x1001` and `0x1004` are detection-only.
+Feature discovery reports `0x1000`, `0x1001`, and `0x1004`. A discovered `0x1004` is preferred because it can report a percentage, coarse level, charging state, and rechargeable capability; the `0x1000` version 0 reader remains the fallback. Percentage and coarse level remain separate optional values, so no coarse level is converted into an invented percentage. The fourth `0x1004` status byte is retained as an external-power indicator only in raw form because the public material consulted does not define its values. `0x1001` remains detection-only.
 
-DPI IDs `0x2201` and `0x2202` are detection-only; there is no DPI read or write.
+For `0x2201`, the reader asks for the sensor count and then reads each sensor's supported DPI representation and current/default DPI. Supported values remain a discrete list or a compact range with a step; the parser does not expand ranges. Device-reported sensor counts are bounded defensively. `0x2202` remains detection-only. No setter, function 3 request, preset, or DPI write API exists.
 
 ## Boundaries and future work
 
 There is no runtime network activity, account, telemetry, persistence, service, or background polling. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
 
-Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. Additional battery formats and DPI reads may be added only after validation. DPI writes, profiles, RGB, macros, remapping, model databases, GUI/tray behavior, startup registration, and updates remain outside phase one.
+Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. Additional battery formats may be added only after validation. DPI writes, profiles, RGB, macros, remapping, model databases, GUI/tray behavior, startup registration, and updates remain outside this phase.

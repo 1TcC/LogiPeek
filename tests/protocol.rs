@@ -1,6 +1,9 @@
 use logipeek::hid::{
     device::{self, Endpoint, FeatureResult},
-    features::battery::{self, Charging, Level},
+    features::{
+        battery::{self, Charging, Level},
+        dpi::{self, DpiValues, SensorDpi},
+    },
     hidpp::{self, Error, Exchange, Feature, Packet, Protocol},
     transport::parse_input,
 };
@@ -291,18 +294,22 @@ fn discover_sends_feature_id_in_big_endian_order() {
 #[test]
 fn battery_parsing_distinguishes_coarse_and_percentage_levels() {
     let coarse = battery::parse_1000(&[9, 2], &[80, 20, 0]).unwrap();
-    assert_eq!(coarse.level, Level::Good);
+    assert_eq!(coarse.percentage, None);
+    assert_eq!(coarse.level, Some(Level::Good));
     assert_eq!(coarse.charging, Charging::Discharging);
     let percentage = battery::parse_1000(&[10, 2], &[80, 20, 1]).unwrap();
-    assert_eq!(percentage.level, Level::Percentage(80));
+    assert_eq!(percentage.percentage, Some(80));
+    assert_eq!(percentage.level, None);
     assert_eq!(percentage.charging, Charging::Charging);
 }
 
 #[test]
 fn battery_zero_is_unknown_and_invalid_ranges_are_rejected() {
     assert_eq!(
-        battery::parse_1000(&[10, 2], &[0, 0, 3]).unwrap().level,
-        Level::Unknown
+        battery::parse_1000(&[10, 2], &[0, 0, 3])
+            .unwrap()
+            .percentage,
+        None
     );
     for (capabilities, status) in [
         (&[1, 0][..], &[50, 0, 0][..]),
@@ -321,6 +328,47 @@ fn battery_zero_is_unknown_and_invalid_ranges_are_rejected() {
 }
 
 #[test]
+fn unified_battery_parses_percentage_coarse_and_unknown_states() {
+    let percentage = battery::parse_1004(3, &[0x0f, 0x03], &[74, 0x04, 1, 1]).unwrap();
+    assert_eq!(percentage.feature_id, 0x1004);
+    assert_eq!(percentage.feature_version, 3);
+    assert_eq!(percentage.percentage, Some(74));
+    assert_eq!(percentage.level, Some(Level::Good));
+    assert_eq!(percentage.charging, Charging::Charging);
+    assert_eq!(percentage.rechargeable, Some(true));
+    assert_eq!(percentage.external_power_raw, Some(1));
+
+    let coarse = battery::parse_1004(2, &[0x0f, 0x01], &[0xff, 0x02, 0, 0]).unwrap();
+    assert_eq!(coarse.percentage, None);
+    assert_eq!(coarse.level, Some(Level::Low));
+    assert_eq!(coarse.charging, Charging::Discharging);
+
+    let unknown = battery::parse_1004(3, &[0x0f, 0x03], &[40, 0x10, 0xa5, 0xfe]).unwrap();
+    assert_eq!(unknown.level, Some(Level::Unknown(0x10)));
+    assert_eq!(unknown.charging, Charging::Unknown(0xa5));
+    assert_eq!(unknown.external_power_raw, Some(0xfe));
+}
+
+#[test]
+fn unified_battery_rejects_truncation_and_invalid_percentage() {
+    for (capabilities, status) in [
+        (&[][..], &[74, 4, 1, 1][..]),
+        (&[0x0f][..], &[74, 4, 1, 1][..]),
+        (&[0x0f, 3][..], &[][..]),
+        (&[0x0f, 3][..], &[74, 4, 1][..]),
+    ] {
+        assert_eq!(
+            battery::parse_1004(3, capabilities, status),
+            Err(Error::Malformed("truncated unified battery data"))
+        );
+    }
+    assert_eq!(
+        battery::parse_1004(3, &[0x0f, 3], &[101, 4, 0, 0]),
+        Err(Error::Malformed("invalid battery percentage"))
+    );
+}
+
+#[test]
 fn battery_read_uses_dynamic_index_and_queries_capabilities_before_status() {
     let feature = Feature {
         id: 0x1000,
@@ -330,9 +378,41 @@ fn battery_read_uses_dynamic_index_and_queries_capabilities_before_status() {
     };
     let mut exchange = QueueExchange::new([Ok(vec![100, 2, 0]), Ok(vec![74, 0, 1])]);
     let battery = battery::read(&mut exchange, 3, feature).unwrap();
-    assert_eq!(battery.level, Level::Percentage(74));
+    assert_eq!(battery.percentage, Some(74));
     assert_eq!(battery.charging, Charging::Charging);
     assert_eq!(exchange.calls, vec![(3, 7, 1, vec![]), (3, 7, 0, vec![])]);
+}
+
+#[test]
+fn unified_battery_read_uses_dynamic_index_and_propagates_errors() {
+    let feature = Feature {
+        id: 0x1004,
+        index: 6,
+        flags: 0,
+        version: 3,
+    };
+    let mut exchange = QueueExchange::new([Ok(vec![0x0f, 3]), Ok(vec![74, 4, 1, 1])]);
+    let result = battery::read(&mut exchange, 1, feature).unwrap();
+    assert_eq!(result.percentage, Some(74));
+    assert_eq!(result.feature_version, 3);
+    assert_eq!(exchange.calls, vec![(1, 6, 0, vec![]), (1, 6, 1, vec![])]);
+
+    let mut capability_error = QueueExchange::new([Err(Error::Io)]);
+    assert_eq!(
+        battery::read(&mut capability_error, 1, feature),
+        Err(Error::Io)
+    );
+    assert_eq!(capability_error.calls, vec![(1, 6, 0, vec![])]);
+
+    let mut status_error = QueueExchange::new([Ok(vec![0x0f, 3]), Err(Error::Timeout)]);
+    assert_eq!(
+        battery::read(&mut status_error, 1, feature),
+        Err(Error::Timeout)
+    );
+    assert_eq!(
+        status_error.calls,
+        vec![(1, 6, 0, vec![]), (1, 6, 1, vec![])]
+    );
 }
 
 #[test]
@@ -373,12 +453,220 @@ fn battery_read_propagates_capability_error_and_skips_status() {
     assert_eq!(exchange.calls, vec![(3, 7, 1, vec![])]);
 }
 
+#[test]
+fn dpi_parses_discrete_values_and_ranges() {
+    assert_eq!(
+        dpi::parse_dpi_values(0, &[0, 0x01, 0x90, 0x03, 0x20, 0x06, 0x40, 0, 0]),
+        Ok(DpiValues::List(vec![400, 800, 1600]))
+    );
+    assert_eq!(
+        dpi::parse_dpi_values(0, &[0, 0x01, 0x90, 0xe0, 0x32, 0x0c, 0x80, 0, 0]),
+        Ok(DpiValues::Range {
+            minimum: 400,
+            maximum: 3200,
+            step: 50,
+        })
+    );
+    assert_eq!(
+        dpi::parse_dpi_values(0, &[0, 0x01, 0x90, 0xe0, 0x3c, 0x0c, 0x80, 0, 0]),
+        Ok(DpiValues::Range {
+            minimum: 400,
+            maximum: 3200,
+            step: 60,
+        })
+    );
+    assert_eq!(
+        dpi::parse_dpi_values(
+            0,
+            &[0, 0, 100, 0, 200, 1, 44, 1, 144, 1, 244, 2, 88, 2, 188, 0],
+        ),
+        Ok(DpiValues::List(vec![100, 200, 300, 400, 500, 600, 700]))
+    );
+}
+
+#[test]
+fn dpi_rejects_bad_sentinels_ranges_and_terminators() {
+    for (data, expected) in [
+        (
+            &[0, 0xe0, 0x32, 0x03, 0x20, 0, 0][..],
+            Error::Malformed("unexpected DPI range sentinel"),
+        ),
+        (
+            &[0, 0x01, 0x90, 0xe0, 0x00, 0x0c, 0x80, 0, 0][..],
+            Error::Malformed("invalid DPI range"),
+        ),
+        (
+            &[0, 0x01, 0x90, 0xe0, 0x32, 0, 0][..],
+            Error::Malformed("unexpected DPI range sentinel"),
+        ),
+        (
+            &[0, 0x01, 0x90, 0xe0, 0x32, 0xe0, 0x64, 0, 0][..],
+            Error::Malformed("unexpected DPI range sentinel"),
+        ),
+        (
+            &[0, 0x0c, 0x80, 0xe0, 0x32, 0x01, 0x90, 0, 0][..],
+            Error::Malformed("invalid DPI range"),
+        ),
+        (
+            &[0, 0x01, 0x90, 0, 0, 1][..],
+            Error::Malformed("nonzero data after DPI terminator"),
+        ),
+    ] {
+        assert_eq!(dpi::parse_dpi_values(0, data), Err(expected));
+    }
+}
+
+#[test]
+fn dpi_parsers_reject_truncation_bad_indices_and_values() {
+    assert_eq!(
+        dpi::parse_sensor_count(&[]),
+        Err(Error::Malformed("truncated DPI sensor count"))
+    );
+    for count in [0, 17] {
+        assert_eq!(
+            dpi::parse_sensor_count(&[count]),
+            Err(Error::Malformed("invalid DPI sensor count"))
+        );
+    }
+    assert_eq!(dpi::parse_sensor_count(&[2]), Ok(2));
+    assert_eq!(
+        dpi::parse_dpi_values(0, &[0, 1]),
+        Err(Error::Malformed("truncated DPI list response"))
+    );
+    assert_eq!(
+        dpi::parse_dpi_values(0, &[1, 0x01, 0x90, 0, 0]),
+        Err(Error::Malformed("DPI sensor index mismatch"))
+    );
+
+    let supported = DpiValues::List(vec![400, 800, 1600]);
+    assert_eq!(
+        dpi::parse_sensor_dpi(0, supported.clone(), &[0, 1, 0x90, 3]),
+        Err(Error::Malformed("truncated current DPI response"))
+    );
+    assert_eq!(
+        dpi::parse_sensor_dpi(0, supported.clone(), &[1, 1, 0x90, 3, 0x20]),
+        Err(Error::Malformed("DPI sensor index mismatch"))
+    );
+    for response in [[0, 0, 0, 3, 0x20], [0, 0xe0, 0, 3, 0x20]] {
+        assert_eq!(
+            dpi::parse_sensor_dpi(0, supported.clone(), &response),
+            Err(Error::Malformed("invalid current DPI"))
+        );
+    }
+    assert_eq!(
+        dpi::parse_sensor_dpi(0, supported.clone(), &[0, 1, 0x90, 0xe0, 0]),
+        Err(Error::Malformed("invalid default DPI"))
+    );
+    assert_eq!(
+        dpi::parse_sensor_dpi(0, supported.clone(), &[0, 1, 0x90, 3, 0x20]),
+        Ok(SensorDpi {
+            sensor: 0,
+            current: 400,
+            default: Some(800),
+            supported,
+        })
+    );
+}
+
+#[test]
+fn dpi_read_handles_multiple_sensors_and_exact_call_order() {
+    let feature = Feature {
+        id: 0x2201,
+        index: 10,
+        flags: 0,
+        version: 2,
+    };
+    let mut exchange = QueueExchange::new([
+        Ok(vec![2]),
+        Ok(vec![0, 0x01, 0x90, 0x03, 0x20, 0, 0]),
+        Ok(vec![0, 0x03, 0x20, 0x01, 0x90]),
+        Ok(vec![1, 0x01, 0x2c, 0xe0, 0x32, 0x06, 0x40, 0, 0]),
+        Ok(vec![1, 0x04, 0xb0, 0, 0]),
+    ]);
+    assert_eq!(
+        dpi::read(&mut exchange, 1, feature),
+        Ok(vec![
+            SensorDpi {
+                sensor: 0,
+                current: 800,
+                default: Some(400),
+                supported: DpiValues::List(vec![400, 800]),
+            },
+            SensorDpi {
+                sensor: 1,
+                current: 1200,
+                default: None,
+                supported: DpiValues::Range {
+                    minimum: 300,
+                    maximum: 1600,
+                    step: 50,
+                },
+            },
+        ])
+    );
+    assert_eq!(
+        exchange.calls,
+        vec![
+            (1, 10, 0, vec![]),
+            (1, 10, 1, vec![0]),
+            (1, 10, 2, vec![0]),
+            (1, 10, 1, vec![1]),
+            (1, 10, 2, vec![1]),
+        ]
+    );
+}
+
+#[test]
+fn dpi_read_propagates_count_and_midstream_errors() {
+    let feature = Feature {
+        id: 0x2201,
+        index: 10,
+        flags: 0,
+        version: 2,
+    };
+    let mut count_error = QueueExchange::new([Err(Error::Io)]);
+    assert_eq!(dpi::read(&mut count_error, 1, feature), Err(Error::Io));
+    assert_eq!(count_error.calls, vec![(1, 10, 0, vec![])]);
+
+    let mut midstream_error = QueueExchange::new([
+        Ok(vec![2]),
+        Ok(vec![0, 0x01, 0x90, 0, 0]),
+        Ok(vec![0, 0x01, 0x90, 0, 0]),
+        Err(Error::Timeout),
+    ]);
+    assert_eq!(
+        dpi::read(&mut midstream_error, 1, feature),
+        Err(Error::Timeout)
+    );
+    assert_eq!(
+        midstream_error.calls,
+        vec![
+            (1, 10, 0, vec![]),
+            (1, 10, 1, vec![0]),
+            (1, 10, 2, vec![0]),
+            (1, 10, 1, vec![1]),
+        ]
+    );
+
+    let mut unsupported = QueueExchange::new(Vec::<Result<Vec<u8>, Error>>::new());
+    let extended_feature = Feature {
+        id: 0x2202,
+        ..feature
+    };
+    assert_eq!(
+        dpi::read(&mut unsupported, 1, extended_feature),
+        Err(Error::Malformed("DPI feature not implemented"))
+    );
+    assert!(unsupported.calls.is_empty());
+}
+
 fn endpoint_with_features(features: Vec<FeatureResult>) -> Endpoint {
     Endpoint {
         index: 1,
         protocol: Ok(Protocol::Feature { major: 2, minor: 0 }),
         features,
         battery: None,
+        dpi: None,
     }
 }
 

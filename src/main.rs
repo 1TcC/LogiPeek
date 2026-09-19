@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 use logipeek::hid::{
-    device::{self, Endpoint},
+    device::{self, Endpoint, ScanOptions},
     features::{
-        battery::{self, Charging, Level},
-        dpi,
+        battery::{self, Charging},
+        dpi::{self, DpiValues},
     },
     hidpp::Protocol,
 };
@@ -13,22 +13,28 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = match args.as_slice() {
         [] => "--help",
-        [arg] if ["--help", "-h", "--devices", "--diag", "--battery"].contains(&arg.as_str()) => {
+        [arg]
+            if ["--help", "-h", "--devices", "--diag", "--battery", "--dpi"]
+                .contains(&arg.as_str()) =>
+        {
             arg
         }
         _ => {
-            eprintln!("Usage: logipeek [--devices | --diag | --battery | --help]");
+            eprintln!("Usage: logipeek [--devices | --diag | --battery | --dpi | --help]");
             return ExitCode::from(2);
         }
     };
     if matches!(mode, "--help" | "-h") {
         println!(
-            "LogiPeek - Windows Logitech HID++ diagnostics\n\n--devices  List Logitech candidates and discovered capabilities\n--diag     Show safe interface and protocol diagnostics\n--battery  Read supported 0x1000 battery information\n\nOne-shot queries; no DPI writes, background service, or network requests."
+            "LogiPeek - Windows Logitech HID++ diagnostics\n\n--devices  List Logitech candidates and discovered capabilities\n--diag     Show safe interface, protocol, battery, and DPI diagnostics\n--battery  Read supported 0x1004 or 0x1000 battery information\n--dpi      Read supported 0x2201 sensor DPI information\n\nOne-shot read-only queries; no DPI writes, background service, or network requests."
         );
         return ExitCode::SUCCESS;
     }
     println!("LogiPeek\n");
-    let interfaces = match device::scan(mode == "--battery") {
+    let interfaces = match device::scan(ScanOptions {
+        read_battery: matches!(mode, "--battery" | "--diag"),
+        read_dpi: matches!(mode, "--dpi" | "--diag"),
+    }) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("Device enumeration failed: {error}");
@@ -69,8 +75,6 @@ fn main() -> ExitCode {
                     "Unavailable"
                 }
             );
-        }
-        if mode == "--diag" {
             match interface.descriptor_bytes {
                 Some(size) => println!(
                     "    Report descriptor: {size} bytes (reconstructed by native HID backend)"
@@ -124,8 +128,11 @@ fn main() -> ExitCode {
                     }
                 }
             }
-            if mode == "--battery" {
+            if mode == "--battery" || (mode == "--diag" && endpoint.battery.is_some()) {
                 print_battery(endpoint);
+            }
+            if mode == "--dpi" || (mode == "--diag" && endpoint.dpi.is_some()) {
+                print_dpi(endpoint);
             }
         }
         if interface.candidate && !found && interface.open_error.is_none() {
@@ -146,9 +153,23 @@ fn main() -> ExitCode {
 fn print_battery(endpoint: &Endpoint) {
     match &endpoint.battery {
         Some(Ok(value)) => {
+            println!(
+                "      Battery feature: 0x{:04X} v{}",
+                value.feature_id, value.feature_version
+            );
+            if let Some(percentage) = value.percentage {
+                println!("      Battery: {percentage}%");
+            }
             match &value.level {
-                Level::Percentage(p) => println!("      Battery: {p}% (device-reported mileage)"),
-                level => println!("      Battery level: {level:?}"),
+                Some(level) => println!("      Battery level: {level:?}"),
+                None if value.percentage.is_none() => println!("      Battery level: Unavailable"),
+                None => {}
+            }
+            if let Some(rechargeable) = value.rechargeable {
+                println!(
+                    "      Rechargeable: {}",
+                    if rechargeable { "Yes" } else { "No" }
+                );
             }
             let status = match value.charging {
                 Charging::Discharging => "No (discharging)",
@@ -161,11 +182,62 @@ fn print_battery(endpoint: &Endpoint) {
                 Charging::Error => "Charging error",
                 Charging::Unknown(_) => "Unknown",
             };
-            println!("      Charging: {status}\n      External power: Unavailable");
+            println!("      Charging: {status}");
+            match value.external_power_raw {
+                Some(raw) => println!(
+                    "      External power: Unknown (raw indicator 0x{raw:02X}; public value semantics unavailable)"
+                ),
+                None => println!("      External power: Unavailable"),
+            }
         }
         Some(Err(error)) => println!("      Battery reading: Unavailable - {error}"),
-        None => println!(
-            "      Battery reading: Unavailable (only 0x1000 version 0 reading implemented)"
-        ),
+        None => println!("      Battery reading: Unsupported or no implemented reader"),
+    }
+}
+
+fn print_dpi(endpoint: &Endpoint) {
+    match &endpoint.dpi {
+        Some(Ok(sensors)) => {
+            if let Some(feature) =
+                endpoint
+                    .features
+                    .iter()
+                    .find_map(|result| match &result.result {
+                        Ok(Some(feature)) if feature.id == 0x2201 => Some(feature),
+                        _ => None,
+                    })
+            {
+                println!("      DPI feature: 0x2201 v{}", feature.version);
+            }
+            println!("      Sensor count: {}", sensors.len());
+            for sensor in sensors {
+                println!("      Sensor {}", sensor.sensor);
+                println!("        Current DPI: {}", sensor.current);
+                match sensor.default {
+                    Some(value) => println!("        Default DPI: {value}"),
+                    None => println!("        Default DPI: Unavailable"),
+                }
+                match &sensor.supported {
+                    DpiValues::List(values) => {
+                        let values = values
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("        Supported DPI: {values}");
+                    }
+                    DpiValues::Range {
+                        minimum,
+                        maximum,
+                        step,
+                    } => {
+                        println!("        Supported DPI: {minimum}-{maximum}");
+                        println!("        Step: {step}");
+                    }
+                }
+            }
+        }
+        Some(Err(error)) => println!("      DPI reading: Unavailable - {error}"),
+        None => println!("      DPI reading: Unsupported or no implemented reader"),
     }
 }
