@@ -1,19 +1,34 @@
 ﻿# Architecture
 
-LogiPeek is a one-shot native Rust CLI with a narrow HID abstraction. It is read-focused and permits one explicit runtime DPI command. It deliberately does not use a web UI, browser runtime, Electron, WebView, Node.js, or a background service: these would add deployment size, dependencies, and persistent activity without helping a short hardware operation.
+LogiPeek is a native Rust Windows tray and one-shot CLI with a narrow HID abstraction. It is read-focused and permits one explicit runtime DPI write path. It deliberately does not use a GUI framework, web UI, browser runtime, Electron, WebView, Node.js, async runtime, database, or background service.
 
 ```text
-CLI → discovery → transport → HID++ protocol → features → battery / DPI reporting
-                                                     └→ validated runtime DPI write
+native Win32 tray ─┐
+                   ├→ AppState → single HID worker → discovery → transport → HID++ → battery / DPI
+one-shot CLI ──────┘                                      └→ validated runtime DPI write
 ```
 
-`main` parses a single mode, invokes `device::scan`, and renders user-facing results. The library forbids unsafe code.
+`main` starts tray mode only when no arguments are present; every existing CLI argument still performs one operation and exits. The core library forbids unsafe code. Raw Win32 calls are isolated in the binary-only `app::tray` module, with documented unsafe blocks and no unsafe HID parsing.
+
+- `app::tray` owns the hidden top-level window, notification icon, popup menu, named single-instance mutex, and blocking Win32 message loop. A small original monochrome mouse icon is generated at startup, avoiding a binary asset. The process detaches its console only after tray initialization succeeds, so CLI output remains intact.
+- `app::state` converts scan results into a small UI snapshot. It exposes fixed 400/800/1600/3200 presets, enables only device-supported values, checks only an exact current match, and disables all writes when no unique target exists.
+- `app::worker` owns the only background thread and a bounded one-command queue. It serializes startup/manual scans, tray DPI writes, and the 60-second battery refresh. `recv_timeout` blocks between work items, and the UI thread blocks in `GetMessageW`; neither loop spins.
 
 - `hid::device` enumerates `hidapi` interfaces whose vendor ID is `0x046D`, sanitizes labels, opens only HID++ query candidates, attempts native report-descriptor reconstruction after a successful open, and retains every interface separately.
 - `hid::transport` performs one physical HID++ request and one bounded response wait over an opened interface, including Windows zero-padded input handling. It never retries a request.
 - `hid::hidpp` strictly parses short (`0x10`, 7-byte) and long (`0x11`, 20-byte) protocol packets, classifies errors, probes HID++ versions, and discovers features.
 - `hid::features::battery` detects `0x1000`, `0x1001`, and `0x1004`. It reads `0x1004` capabilities/status and retains the `0x1000` version 0 reader as a fallback.
 - `hid::features::dpi` detects `0x2201` and `0x2202`, implements the `0x2201` sensor count, supported-values, and current/default queries, and exposes the narrowly scoped function 3 runtime setter used only after CLI preflight.
+
+## Tray behavior and concurrency
+
+The tray menu is built from a locked clone of `AppState` and destroyed after each popup closes. Battery and DPI values therefore come only from completed hardware scans; failed full scans replace them with unavailable state instead of presenting stale data as current. A battery-only refresh retains DPI only when the same sole target is still present. Multiple usable targets produce an explicit multiple-device state and disable every preset.
+
+The worker executes `device::set_unique_runtime_dpi`, the same function used by `--set-dpi`. Every click therefore receives a fresh discovery/preflight, unique endpoint and single-sensor check, supported-value validation, one function 3 attempt, and the existing readback classification. The bounded queue prevents repeated clicks from creating an unbounded series of writes. The worker performs a full rescan after a write and posts a state-update message to the UI thread.
+
+The notification icon is re-added after Explorer broadcasts `TaskbarCreated`. Exit removes the icon, destroys the hidden window, stops and joins the worker, destroys the icon handle, unregisters the class, and releases the named mutex. A second no-argument process exits normally; CLI processes do not acquire this mutex.
+
+The only new direct dependency is `windows-sys`, with the Foundation, GDI, Security, Console, LibraryLoader, Threading, Shell, and WindowsAndMessaging feature groups. It was already present transitively through the native HID backend; declaring it directly exposes the required raw Win32 APIs without a GUI framework or runtime.
 
 ## Capability-first discovery
 
@@ -51,6 +66,6 @@ After validation, function 3 receives `[sensor index, DPI MSB, DPI LSB]` through
 
 ## Boundaries and future work
 
-There is no runtime network activity, account, telemetry, persistence, service, or background polling. The function 3 command changes only the active runtime DPI exposed by `0x2201`; it does not save a preset, profile, onboard setting, or startup configuration. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
+There is no runtime network activity, account, telemetry, persistence, service, or busy polling. The tray's only periodic work is the 60-second battery refresh. Function 3 changes only the active runtime DPI exposed by `0x2201`; the four menu values are fixed choices rather than saved presets, profiles, onboard settings, or startup configuration. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
 
-Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. Additional battery formats may be added only after validation. DPI presets, persistence, profiles, `0x2202` writes, RGB, macros, remapping, model databases, GUI/tray behavior, startup registration, and updates remain outside this phase.
+Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. A main GUI window, user-defined presets, persistence, profiles, `0x2202` writes, RGB, macros, remapping, model databases, startup registration, and updates remain outside this phase.

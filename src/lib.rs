@@ -1,2 +1,3 @@
-﻿#![forbid(unsafe_code)]
+#![forbid(unsafe_code)]
+pub mod app;
 pub mod hid;

@@ -1,4 +1,7 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#[cfg(windows)]
+#[path = "app/tray.rs"]
+mod tray;
 use logipeek::hid::{
     device::{self, Endpoint, ScanOptions},
     features::{
@@ -12,6 +15,23 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        #[cfg(windows)]
+        {
+            return match tray::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Tray startup failed: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("Tray mode is available only on Windows.");
+            return ExitCode::FAILURE;
+        }
+    }
     if let [flag, value] = args.as_slice()
         && flag == "--set-dpi"
     {
@@ -41,7 +61,7 @@ fn main() -> ExitCode {
     };
     if matches!(mode, "--help" | "-h") {
         println!(
-            "LogiPeek - Windows Logitech HID++ diagnostics\n\n--devices         List Logitech candidates and discovered capabilities\n--diag            Show safe interface, protocol, battery, and DPI diagnostics\n--battery         Read supported 0x1004 or 0x1000 battery information\n--dpi             Read supported 0x2201 sensor DPI information\n--set-dpi <DPI>   Set runtime DPI on one unique target; rejects unsupported values; writes are never auto-retried\n\nOne-shot local operations; no profiles, persistence, background service, or network requests."
+            "LogiPeek - Windows Logitech HID++ diagnostics\n\n(no arguments)   Start the Windows tray\n--devices         List Logitech candidates and discovered capabilities\n--diag            Show safe interface, protocol, battery, and DPI diagnostics\n--battery         Read supported 0x1004 or 0x1000 battery information\n--dpi             Read supported 0x2201 sensor DPI information\n--set-dpi <DPI>   Set runtime DPI on one unique target; rejects unsupported values; writes are never auto-retried\n\nLocal operations only; no profiles, persistence, background service, or network requests."
         );
         return ExitCode::SUCCESS;
     }
