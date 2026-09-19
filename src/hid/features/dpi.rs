@@ -1,4 +1,4 @@
-use crate::hid::hidpp::{Error, Exchange, Feature};
+use crate::hid::hidpp::{self, Error, Exchange, Feature};
 
 pub const FEATURE_IDS: [u16; 2] = [0x2201, 0x2202];
 const MAX_SENSOR_COUNT: u8 = 16;
@@ -128,18 +128,19 @@ pub fn read(
     if feature.id != 0x2201 {
         return Err(Error::Malformed("DPI feature not implemented"));
     }
-    let count = parse_sensor_count(&transport.exchange(device, feature.index, 0, &[])?)?;
+    let count_response = hidpp::read_only_exchange(transport, device, feature.index, 0, &[])
+        .map_err(|error| error.in_read("0x2201 sensor count (fn0)"))?;
+    let count = parse_sensor_count(&count_response)?;
     let mut sensors = Vec::with_capacity(count as usize);
     for sensor in 0..count {
-        let supported = parse_dpi_values(
-            sensor,
-            &transport.exchange(device, feature.index, 1, &[sensor])?,
-        )?;
-        sensors.push(parse_sensor_dpi(
-            sensor,
-            supported,
-            &transport.exchange(device, feature.index, 2, &[sensor])?,
-        )?);
+        let supported_response =
+            hidpp::read_only_exchange(transport, device, feature.index, 1, &[sensor])
+                .map_err(|error| error.in_read("0x2201 supported DPI (fn1)"))?;
+        let supported = parse_dpi_values(sensor, &supported_response)?;
+        let current_response =
+            hidpp::read_only_exchange(transport, device, feature.index, 2, &[sensor])
+                .map_err(|error| error.in_read("0x2201 current DPI (fn2)"))?;
+        sensors.push(parse_sensor_dpi(sensor, supported, &current_response)?);
     }
     Ok(sensors)
 }

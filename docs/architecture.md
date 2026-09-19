@@ -9,7 +9,7 @@ CLI → discovery → transport → HID++ protocol → features → battery / DP
 `main` parses a single mode, invokes `device::scan`, and renders user-facing results. The library forbids unsafe code.
 
 - `hid::device` enumerates `hidapi` interfaces whose vendor ID is `0x046D`, sanitizes labels, opens only HID++ query candidates, attempts native report-descriptor reconstruction after a successful open, and retains every interface separately.
-- `hid::transport` performs serial HID++ exchanges over one opened interface, including Windows zero-padded input handling.
+- `hid::transport` performs one physical HID++ request and one bounded response wait over an opened interface, including Windows zero-padded input handling. It never retries a request.
 - `hid::hidpp` strictly parses short (`0x10`, 7-byte) and long (`0x11`, 20-byte) protocol packets, classifies errors, probes HID++ versions, and discovers features.
 - `hid::features::battery` detects `0x1000`, `0x1001`, and `0x1004`. It reads `0x1004` capabilities/status and retains the `0x1000` version 0 reader as a fallback.
 - `hid::features::dpi` detects `0x2201` and `0x2202` and implements the read-only `0x2201` sensor count, supported-values, and current/default queries. It contains no write operation.
@@ -26,7 +26,9 @@ A successful ping identifies HID++ 2.x feature protocol or HID++ 1.x. HID++ 1.x 
 
 ## Request and failure behavior
 
-The transport makes one request at a time and rotates software ID values `1..15` per request. After the write returns, it gives matching replies a 350 ms deadline and consumes at most 128 reports. The 350 ms bound applies to reply waiting, not the entire exchange: the Windows backend write can itself take up to about one second. The transport ignores unrelated notifications and replies, matches device, feature, function, and software ID, and exposes transport, timeout, malformed-response, and protocol errors rather than panicking.
+The transport makes one request at a time and rotates software ID values `1..15` per request. After the write returns, it gives matching replies a 750 ms deadline and consumes at most 128 reports. The 750 ms bound applies to reply waiting, not the entire exchange: the Windows backend write can itself take up to about one second. The transport ignores unrelated notifications and replies, matches device, feature, function, and software ID, and exposes transport, timeout, malformed-response, and protocol errors rather than panicking.
+
+`hidpp::read_only_exchange` is an explicit recovery layer for idempotent reads. It permits two attempts and retries only Timeout, HID++ 1.x Busy `0x07`, or HID++ 2.x Busy `0x08`. Every attempt calls the transport separately and therefore gets a new nonzero software ID. Generic exchanges do not retry, so a future setter cannot be repeated after an ambiguous timeout unless a caller explicitly violates the read-only API contract.
 
 Windows may return a short HID++ input report padded with zero bytes to the collection's maximum input size. `transport::parse_input` accepts only zero padding up to 64 bytes, then passes the exact report slice to the strict `Packet::parse` parser.
 

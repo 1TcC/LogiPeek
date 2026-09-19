@@ -2,6 +2,10 @@
 use hidapi::HidDevice;
 use std::time::{Duration, Instant};
 
+/// One physical request gets one bounded response window. Retries belong only
+/// in the explicit read-only layer.
+pub const RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
+
 pub struct Transport {
     handle: HidDevice,
     report: u8,
@@ -42,7 +46,7 @@ impl Exchange for Transport {
         if written != 0 && written < request.len() {
             return Err(Error::Io);
         }
-        let deadline = Instant::now() + Duration::from_millis(350);
+        let deadline = Instant::now() + RESPONSE_TIMEOUT;
         let mut buffer = [0u8; 64];
         // Bound both elapsed time and unrelated traffic; never poll in the background.
         for _ in 0..128 {
@@ -50,7 +54,7 @@ impl Exchange for Transport {
             if remaining.is_zero() {
                 break;
             }
-            let timeout = remaining.as_millis().clamp(1, 350) as i32;
+            let timeout = remaining.as_millis().clamp(1, RESPONSE_TIMEOUT.as_millis()) as i32;
             let count = self
                 .handle
                 .read_timeout(&mut buffer, timeout)

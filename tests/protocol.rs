@@ -4,7 +4,7 @@ use logipeek::hid::{
         battery::{self, Charging, Level},
         dpi::{self, DpiValues, SensorDpi},
     },
-    hidpp::{self, Error, Exchange, Feature, Packet, Protocol},
+    hidpp::{self, Error, Exchange, Feature, Packet, Protocol, READ_ONLY_ATTEMPTS},
     transport::parse_input,
 };
 use std::collections::VecDeque;
@@ -217,6 +217,112 @@ struct QueueExchange {
     calls: Vec<(u8, u8, u8, Vec<u8>)>,
 }
 
+#[test]
+fn read_only_exchange_retries_timeout_then_succeeds() {
+    let mut exchange = QueueExchange::new([Err(Error::Timeout), Ok(vec![1, 2, 3])]);
+    assert_eq!(
+        hidpp::read_only_exchange(&mut exchange, 2, 7, 1, &[9]),
+        Ok(vec![1, 2, 3])
+    );
+    assert_eq!(exchange.calls.len(), 2);
+}
+
+#[test]
+fn read_only_exchange_retries_timeout_only_once() {
+    let mut exchange = QueueExchange::new([Err(Error::Timeout), Err(Error::Timeout)]);
+    assert_eq!(
+        hidpp::read_only_exchange(&mut exchange, 2, 7, 1, &[]),
+        Err(Error::Timeout)
+    );
+    assert_eq!(exchange.calls.len(), READ_ONLY_ATTEMPTS as usize);
+}
+
+#[test]
+fn read_only_exchange_retries_hidpp_busy_errors() {
+    for error in [
+        Error::Protocol {
+            legacy: false,
+            code: 0x08,
+        },
+        Error::Protocol {
+            legacy: true,
+            code: 0x07,
+        },
+    ] {
+        let mut exchange = QueueExchange::new([Err(error), Ok(vec![0xaa])]);
+        assert_eq!(
+            hidpp::read_only_exchange(&mut exchange, 1, 2, 1, &[]),
+            Ok(vec![0xaa])
+        );
+        assert_eq!(exchange.calls.len(), 2);
+    }
+}
+
+#[test]
+fn read_only_exchange_does_not_retry_non_retryable_or_malformed_errors() {
+    for error in [
+        Error::Io,
+        Error::Protocol {
+            legacy: false,
+            code: 0x09,
+        },
+        Error::Protocol {
+            legacy: true,
+            code: 0x08,
+        },
+        Error::Malformed("bad response"),
+    ] {
+        let mut exchange = QueueExchange::new([Err(error.clone()), Ok(vec![1])]);
+        assert_eq!(
+            hidpp::read_only_exchange(&mut exchange, 1, 2, 1, &[]),
+            Err(error)
+        );
+        assert_eq!(exchange.calls.len(), 1);
+    }
+}
+
+#[test]
+fn packet_response_requires_current_software_id_and_ignores_late_reply() {
+    let request = [0x10, 0x02, 0x20, 0x55];
+    let late = Packet {
+        report: 0x10,
+        device: 0x02,
+        feature: 0x20,
+        function: 0x54,
+        parameters: vec![1],
+    };
+    assert_eq!(late.response_to(&request), None);
+
+    let current = Packet {
+        report: 0x10,
+        device: 0x02,
+        feature: 0x20,
+        function: 0x55,
+        parameters: vec![1],
+    };
+    assert_eq!(current.response_to(&request), Some(Ok(vec![1])));
+
+    let late_error = Packet {
+        report: 0x10,
+        device: 0x02,
+        feature: 0xff,
+        function: 0x20,
+        parameters: vec![0x54, 0x08],
+    };
+    assert_eq!(late_error.response_to(&request), None);
+    let current_error = Packet {
+        parameters: vec![0x55, 0x08],
+        ..late_error
+    };
+    assert_eq!(
+        current_error.response_to(&request),
+        Some(Err(Error::Protocol {
+            legacy: false,
+            code: 0x08,
+        }))
+    );
+}
+
 impl QueueExchange {
     fn new(replies: impl IntoIterator<Item = Result<Vec<u8>, Error>>) -> Self {
         Self {
@@ -400,18 +506,24 @@ fn unified_battery_read_uses_dynamic_index_and_propagates_errors() {
     let mut capability_error = QueueExchange::new([Err(Error::Io)]);
     assert_eq!(
         battery::read(&mut capability_error, 1, feature),
-        Err(Error::Io)
+        Err(Error::Read {
+            operation: "0x1004 capabilities (fn0)",
+            source: Box::new(Error::Io),
+        })
     );
     assert_eq!(capability_error.calls, vec![(1, 6, 0, vec![])]);
 
     let mut status_error = QueueExchange::new([Ok(vec![0x0f, 3]), Err(Error::Timeout)]);
     assert_eq!(
         battery::read(&mut status_error, 1, feature),
-        Err(Error::Timeout)
+        Err(Error::Read {
+            operation: "0x1004 status (fn1)",
+            source: Box::new(Error::Timeout),
+        })
     );
     assert_eq!(
         status_error.calls,
-        vec![(1, 6, 0, vec![]), (1, 6, 1, vec![])]
+        vec![(1, 6, 0, vec![]), (1, 6, 1, vec![]), (1, 6, 1, vec![])]
     );
 }
 
@@ -449,7 +561,13 @@ fn battery_read_propagates_capability_error_and_skips_status() {
         version: 0,
     };
     let mut exchange = QueueExchange::new([Err(Error::Io), Ok(vec![74, 0, 1])]);
-    assert_eq!(battery::read(&mut exchange, 3, feature), Err(Error::Io));
+    assert_eq!(
+        battery::read(&mut exchange, 3, feature),
+        Err(Error::Read {
+            operation: "0x1000 capabilities (fn1)",
+            source: Box::new(Error::Io),
+        })
+    );
     assert_eq!(exchange.calls, vec![(3, 7, 1, vec![])]);
 }
 
@@ -625,7 +743,13 @@ fn dpi_read_propagates_count_and_midstream_errors() {
         version: 2,
     };
     let mut count_error = QueueExchange::new([Err(Error::Io)]);
-    assert_eq!(dpi::read(&mut count_error, 1, feature), Err(Error::Io));
+    assert_eq!(
+        dpi::read(&mut count_error, 1, feature),
+        Err(Error::Read {
+            operation: "0x2201 sensor count (fn0)",
+            source: Box::new(Error::Io),
+        })
+    );
     assert_eq!(count_error.calls, vec![(1, 10, 0, vec![])]);
 
     let mut midstream_error = QueueExchange::new([
@@ -636,7 +760,10 @@ fn dpi_read_propagates_count_and_midstream_errors() {
     ]);
     assert_eq!(
         dpi::read(&mut midstream_error, 1, feature),
-        Err(Error::Timeout)
+        Err(Error::Read {
+            operation: "0x2201 supported DPI (fn1)",
+            source: Box::new(Error::Timeout),
+        })
     );
     assert_eq!(
         midstream_error.calls,
@@ -644,6 +771,7 @@ fn dpi_read_propagates_count_and_midstream_errors() {
             (1, 10, 0, vec![]),
             (1, 10, 1, vec![0]),
             (1, 10, 2, vec![0]),
+            (1, 10, 1, vec![1]),
             (1, 10, 1, vec![1]),
         ]
     );

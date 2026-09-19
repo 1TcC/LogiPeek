@@ -1,4 +1,4 @@
-use crate::hid::hidpp::{Error, Exchange, Feature};
+use crate::hid::hidpp::{self, Error, Exchange, Feature};
 
 pub const FEATURE_IDS: [u16; 3] = [0x1000, 0x1001, 0x1004];
 
@@ -130,13 +130,17 @@ pub fn parse_1004(
 pub fn read(transport: &mut impl Exchange, device: u8, feature: Feature) -> Result<Battery, Error> {
     match (feature.id, feature.version) {
         (0x1000, 0) => {
-            let capabilities = transport.exchange(device, feature.index, 1, &[])?;
-            let status = transport.exchange(device, feature.index, 0, &[])?;
+            let capabilities = hidpp::read_only_exchange(transport, device, feature.index, 1, &[])
+                .map_err(|error| error.in_read("0x1000 capabilities (fn1)"))?;
+            let status = hidpp::read_only_exchange(transport, device, feature.index, 0, &[])
+                .map_err(|error| error.in_read("0x1000 status (fn0)"))?;
             parse_1000(&capabilities, &status)
         }
         (0x1004, version) => {
-            let capabilities = transport.exchange(device, feature.index, 0, &[])?;
-            let status = transport.exchange(device, feature.index, 1, &[])?;
+            let capabilities = hidpp::read_only_exchange(transport, device, feature.index, 0, &[])
+                .map_err(|error| error.in_read("0x1004 capabilities (fn0)"))?;
+            let status = hidpp::read_only_exchange(transport, device, feature.index, 1, &[])
+                .map_err(|error| error.in_read("0x1004 status (fn1)"))?;
             parse_1004(version, &capabilities, &status)
         }
         _ => Err(Error::Malformed("battery feature version not implemented")),

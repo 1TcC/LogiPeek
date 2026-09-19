@@ -5,7 +5,8 @@ use logipeek::hid::{
         battery::{self, Charging},
         dpi::{self, DpiValues},
     },
-    hidpp::Protocol,
+    hidpp::{Protocol, READ_ONLY_ATTEMPTS},
+    transport::RESPONSE_TIMEOUT,
 };
 use std::process::ExitCode;
 
@@ -31,6 +32,13 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("LogiPeek\n");
+    if mode == "--diag" {
+        println!(
+            "Read policy: {} ms per request, up to {} attempts for timeout or HID++ Busy\n",
+            RESPONSE_TIMEOUT.as_millis(),
+            READ_ONLY_ATTEMPTS
+        );
+    }
     let interfaces = match device::scan(ScanOptions {
         read_battery: matches!(mode, "--battery" | "--diag"),
         read_dpi: matches!(mode, "--dpi" | "--diag"),

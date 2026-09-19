@@ -5,7 +5,14 @@ pub enum Error {
     Io,
     Timeout,
     Malformed(&'static str),
-    Protocol { legacy: bool, code: u8 },
+    Protocol {
+        legacy: bool,
+        code: u8,
+    },
+    Read {
+        operation: &'static str,
+        source: Box<Error>,
+    },
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -20,10 +27,42 @@ impl fmt::Display for Error {
                 "HID++ {} error 0x{code:02X}",
                 if *legacy { "1.x" } else { "2.x" }
             ),
+            Self::Read { operation, source } => write!(f, "{operation}: {source}"),
         }
     }
 }
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl Error {
+    pub fn in_read(self, operation: &'static str) -> Self {
+        Self::Read {
+            operation,
+            source: Box::new(self),
+        }
+    }
+
+    pub fn is_retryable_read(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Protocol {
+                    legacy: true,
+                    code: 0x07
+                }
+                | Self::Protocol {
+                    legacy: false,
+                    code: 0x08
+                }
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
@@ -120,9 +159,31 @@ pub trait Exchange {
     ) -> Result<Vec<u8>, Error>;
 }
 
+pub const READ_ONLY_ATTEMPTS: u8 = 2;
+
+/// Retry only an idempotent, read-only request. Set/write/reset operations must
+/// call `Exchange::exchange` directly so a timeout can never duplicate a write.
+pub fn read_only_exchange(
+    transport: &mut impl Exchange,
+    device: u8,
+    feature: u8,
+    function: u8,
+    parameters: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut attempt = 1;
+    loop {
+        match transport.exchange(device, feature, function, parameters) {
+            Err(error) if attempt < READ_ONLY_ATTEMPTS && error.is_retryable_read() => {
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub fn probe(transport: &mut impl Exchange, device: u8) -> Result<Protocol, Error> {
     let ping = 0xa5;
-    match transport.exchange(device, 0, 1, &[0, 0, ping]) {
+    match read_only_exchange(transport, device, 0, 1, &[0, 0, ping]) {
         Err(Error::Protocol {
             legacy: true,
             code: 1,
@@ -141,5 +202,8 @@ pub fn discover(
     device: u8,
     id: u16,
 ) -> Result<Option<Feature>, Error> {
-    Feature::parse(id, &transport.exchange(device, 0, 0, &id.to_be_bytes())?)
+    Feature::parse(
+        id,
+        &read_only_exchange(transport, device, 0, 0, &id.to_be_bytes())?,
+    )
 }
