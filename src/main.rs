@@ -12,6 +12,18 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, value] = args.as_slice()
+        && flag == "--set-dpi"
+    {
+        let requested = match value.parse::<u16>() {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("Invalid DPI value: {value}. Expected an integer from 0 to 65535.");
+                return ExitCode::from(2);
+            }
+        };
+        return run_set_dpi(requested);
+    }
     let mode = match args.as_slice() {
         [] => "--help",
         [arg]
@@ -21,13 +33,15 @@ fn main() -> ExitCode {
             arg
         }
         _ => {
-            eprintln!("Usage: logipeek [--devices | --diag | --battery | --dpi | --help]");
+            eprintln!(
+                "Usage: logipeek [--devices | --diag | --battery | --dpi | --set-dpi <DPI> | --help]"
+            );
             return ExitCode::from(2);
         }
     };
     if matches!(mode, "--help" | "-h") {
         println!(
-            "LogiPeek - Windows Logitech HID++ diagnostics\n\n--devices  List Logitech candidates and discovered capabilities\n--diag     Show safe interface, protocol, battery, and DPI diagnostics\n--battery  Read supported 0x1004 or 0x1000 battery information\n--dpi      Read supported 0x2201 sensor DPI information\n\nOne-shot read-only queries; no DPI writes, background service, or network requests."
+            "LogiPeek - Windows Logitech HID++ diagnostics\n\n--devices         List Logitech candidates and discovered capabilities\n--diag            Show safe interface, protocol, battery, and DPI diagnostics\n--battery         Read supported 0x1004 or 0x1000 battery information\n--dpi             Read supported 0x2201 sensor DPI information\n--set-dpi <DPI>   Set runtime DPI on one unique target; rejects unsupported values; writes are never auto-retried\n\nOne-shot local operations; no profiles, persistence, background service, or network requests."
         );
         return ExitCode::SUCCESS;
     }
@@ -156,6 +170,64 @@ fn main() -> ExitCode {
         "\nDetection is not a compatibility guarantee; receiver names do not identify paired mice."
     );
     ExitCode::SUCCESS
+}
+
+fn run_set_dpi(requested: u16) -> ExitCode {
+    println!("LogiPeek\n\nRunning fresh DPI preflight for requested value {requested}...");
+    let report = match device::set_unique_runtime_dpi(requested) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("DPI change refused: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "Target: interface {}, {:04X}:{:04X} {}, device 0x{:02X}, 0x2201 v{}\nPrevious DPI: {}\nRequested DPI: {}",
+        report.interface_number,
+        report.vid,
+        report.pid,
+        report.product,
+        report.device_index,
+        report.feature_version,
+        report.previous,
+        report.requested
+    );
+    match report.outcome {
+        dpi::SetDpiOutcome::Verified { current } => {
+            println!("Result: write acknowledged and read-back verified {current} DPI");
+            ExitCode::SUCCESS
+        }
+        dpi::SetDpiOutcome::AcknowledgedMismatch { actual } => {
+            eprintln!(
+                "Result: write acknowledged, but read-back reported {actual} DPI; write was not retried"
+            );
+            ExitCode::FAILURE
+        }
+        dpi::SetDpiOutcome::AcknowledgedUnverified { error } => {
+            eprintln!(
+                "Result: write acknowledged, but read-back was unavailable ({error}); write was not retried"
+            );
+            ExitCode::FAILURE
+        }
+        dpi::SetDpiOutcome::TimedOutConfirmed { current } => {
+            println!(
+                "Result: setter acknowledgement timed out, but safe read-back confirms {current} DPI; write was not retried"
+            );
+            ExitCode::SUCCESS
+        }
+        dpi::SetDpiOutcome::TimedOutDifferent { actual } => {
+            eprintln!(
+                "Result: setter acknowledgement timed out; safe read-back reports {actual} DPI; write was not retried"
+            );
+            ExitCode::FAILURE
+        }
+        dpi::SetDpiOutcome::TimedOutUnverified { error } => {
+            eprintln!(
+                "Result: setter acknowledgement timed out and read-back was unavailable ({error}); outcome is unknown and the write was not retried"
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_battery(endpoint: &Endpoint) {

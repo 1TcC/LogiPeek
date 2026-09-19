@@ -2,7 +2,7 @@ use logipeek::hid::{
     device::{self, Endpoint, FeatureResult},
     features::{
         battery::{self, Charging, Level},
-        dpi::{self, DpiValues, SensorDpi},
+        dpi::{self, DpiValues, SensorDpi, SetDpiError, SetDpiOutcome},
     },
     hidpp::{self, Error, Exchange, Feature, Packet, Protocol, READ_ONLY_ATTEMPTS},
     transport::parse_input,
@@ -631,6 +631,189 @@ fn dpi_rejects_bad_sentinels_ranges_and_terminators() {
         ),
     ] {
         assert_eq!(dpi::parse_dpi_values(0, data), Err(expected));
+    }
+}
+
+#[test]
+fn dpi_support_and_nearest_cover_lists_ranges_ties_and_bounds() {
+    let list = DpiValues::List(vec![400, 800, 1600]);
+    assert!(dpi::supports_dpi(&list, 800));
+    assert!(!dpi::supports_dpi(&list, 801));
+    assert_eq!(dpi::nearest_supported_dpi(&list, 600), Some(800));
+    assert_eq!(dpi::nearest_supported_dpi(&list, 100), Some(400));
+    assert_eq!(dpi::nearest_supported_dpi(&list, 2000), Some(1600));
+    let range = DpiValues::Range {
+        minimum: 400,
+        maximum: 1600,
+        step: 100,
+    };
+    assert!(dpi::supports_dpi(&range, 400));
+    assert!(dpi::supports_dpi(&range, 900));
+    assert!(dpi::supports_dpi(&range, 1600));
+    assert!(!dpi::supports_dpi(&range, 950));
+    assert_eq!(dpi::nearest_supported_dpi(&range, 350), Some(400));
+    assert_eq!(dpi::nearest_supported_dpi(&range, 450), Some(500));
+    assert_eq!(dpi::nearest_supported_dpi(&range, 1700), Some(1600));
+    let invalid_range = DpiValues::Range {
+        minimum: 400,
+        maximum: 1600,
+        step: 0,
+    };
+    assert!(!dpi::supports_dpi(&invalid_range, 400));
+    assert_eq!(dpi::nearest_supported_dpi(&invalid_range, 800), None);
+}
+
+fn writable_sensor() -> SensorDpi {
+    SensorDpi {
+        sensor: 2,
+        current: 800,
+        default: None,
+        supported: DpiValues::List(vec![400, 800, 1600]),
+    }
+}
+
+#[test]
+fn dpi_set_validates_before_exchange_and_writes_sensor_and_value_big_endian_once() {
+    let sensor = writable_sensor();
+    let feature = Feature {
+        id: 0x2201,
+        index: 9,
+        flags: 0,
+        version: 3,
+    };
+    for (feature, sensor_count, requested, expected) in [
+        (
+            Feature {
+                id: 0x2202,
+                ..feature
+            },
+            3,
+            800,
+            SetDpiError::InvalidFeature,
+        ),
+        (feature, 2, 800, SetDpiError::InvalidSensor),
+        (
+            feature,
+            3,
+            801,
+            SetDpiError::Unsupported {
+                requested: 801,
+                nearest: Some(800),
+            },
+        ),
+    ] {
+        let mut exchange = QueueExchange::new(Vec::<Result<Vec<u8>, Error>>::new());
+        assert_eq!(
+            dpi::set_and_verify(&mut exchange, 1, feature, sensor_count, &sensor, requested),
+            Err(expected)
+        );
+        assert!(exchange.calls.is_empty());
+    }
+    let mut exchange =
+        QueueExchange::new([Ok(vec![2, 0x06, 0x40]), Ok(vec![2, 0x06, 0x40, 0x00, 0x00])]);
+    assert_eq!(
+        dpi::set_and_verify(&mut exchange, 1, feature, 3, &sensor, 1600),
+        Ok(SetDpiOutcome::Verified { current: 1600 })
+    );
+    assert_eq!(
+        exchange.calls,
+        vec![(1, 9, 3, vec![2, 0x06, 0x40]), (1, 9, 2, vec![2])]
+    );
+}
+
+#[test]
+fn dpi_set_handles_ack_mismatch_and_readback_outcomes_without_retrying_fn3() {
+    let sensor = writable_sensor();
+    let feature = Feature {
+        id: 0x2201,
+        index: 9,
+        flags: 0,
+        version: 3,
+    };
+    let mut bad_ack = QueueExchange::new([Ok(vec![2, 0x03, 0x21])]);
+    assert_eq!(
+        dpi::set_and_verify(&mut bad_ack, 1, feature, 3, &sensor, 1600),
+        Err(SetDpiError::Write(Error::Malformed(
+            "DPI setter acknowledgement mismatch"
+        )))
+    );
+    assert_eq!(bad_ack.calls.len(), 1);
+    let protocol_error = Error::Protocol {
+        legacy: false,
+        code: 0x08,
+    };
+    let mut rejected = QueueExchange::new([Err(protocol_error.clone()), Ok(vec![2, 0x06, 0x40])]);
+    assert_eq!(
+        dpi::set_and_verify(&mut rejected, 1, feature, 3, &sensor, 1600),
+        Err(SetDpiError::Write(protocol_error))
+    );
+    assert_eq!(rejected.calls, vec![(1, 9, 3, vec![2, 0x06, 0x40])]);
+    for (replies, expected) in [
+        (
+            vec![Ok(vec![2, 0x06, 0x40]), Ok(vec![2, 0x03, 0x20, 0x03, 0x20])],
+            SetDpiOutcome::AcknowledgedMismatch { actual: 800 },
+        ),
+        (
+            vec![
+                Ok(vec![2, 0x06, 0x40]),
+                Err(Error::Timeout),
+                Err(Error::Timeout),
+            ],
+            SetDpiOutcome::AcknowledgedUnverified {
+                error: Error::Read {
+                    operation: "0x2201 DPI write read-back (fn2)",
+                    source: Box::new(Error::Timeout),
+                },
+            },
+        ),
+    ] {
+        let mut exchange = QueueExchange::new(replies);
+        assert_eq!(
+            dpi::set_and_verify(&mut exchange, 1, feature, 3, &sensor, 1600),
+            Ok(expected)
+        );
+        assert_eq!(exchange.calls.iter().filter(|call| call.2 == 3).count(), 1);
+    }
+}
+
+#[test]
+fn dpi_set_timeout_uses_readback_to_classify_confirmed_different_or_unverified() {
+    let sensor = writable_sensor();
+    let feature = Feature {
+        id: 0x2201,
+        index: 9,
+        flags: 0,
+        version: 3,
+    };
+    for (replies, expected) in [
+        (
+            vec![Err(Error::Timeout), Ok(vec![2, 0x06, 0x40, 0, 0])],
+            SetDpiOutcome::TimedOutConfirmed { current: 1600 },
+        ),
+        (
+            vec![Err(Error::Timeout), Ok(vec![2, 0x03, 0x20, 0, 0])],
+            SetDpiOutcome::TimedOutDifferent { actual: 800 },
+        ),
+        (
+            vec![
+                Err(Error::Timeout),
+                Err(Error::Timeout),
+                Err(Error::Timeout),
+            ],
+            SetDpiOutcome::TimedOutUnverified {
+                error: Error::Read {
+                    operation: "0x2201 DPI write read-back (fn2)",
+                    source: Box::new(Error::Timeout),
+                },
+            },
+        ),
+    ] {
+        let mut exchange = QueueExchange::new(replies);
+        assert_eq!(
+            dpi::set_and_verify(&mut exchange, 1, feature, 3, &sensor, 1600),
+            Ok(expected)
+        );
+        assert_eq!(exchange.calls.iter().filter(|call| call.2 == 3).count(), 1);
     }
 }
 

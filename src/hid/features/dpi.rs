@@ -21,6 +21,110 @@ pub struct SensorDpi {
     pub supported: DpiValues,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetDpiOutcome {
+    Verified { current: u16 },
+    AcknowledgedMismatch { actual: u16 },
+    AcknowledgedUnverified { error: Error },
+    TimedOutConfirmed { current: u16 },
+    TimedOutDifferent { actual: u16 },
+    TimedOutUnverified { error: Error },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetDpiError {
+    InvalidFeature,
+    InvalidSensor,
+    Unsupported {
+        requested: u16,
+        nearest: Option<u16>,
+    },
+    Write(Error),
+}
+
+impl std::fmt::Display for SetDpiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFeature => f.write_str("DPI write requires feature 0x2201"),
+            Self::InvalidSensor => f.write_str("DPI write sensor index is invalid"),
+            Self::Unsupported {
+                requested,
+                nearest: Some(nearest),
+            } => write!(
+                f,
+                "DPI {requested} is unsupported; nearest supported value is {nearest}"
+            ),
+            Self::Unsupported {
+                requested,
+                nearest: None,
+            } => write!(
+                f,
+                "DPI {requested} is unsupported; no valid value was reported"
+            ),
+            Self::Write(error) => write!(f, "DPI write failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SetDpiError {}
+
+pub fn supports_dpi(values: &DpiValues, dpi: u16) -> bool {
+    match values {
+        DpiValues::List(values) => values.contains(&dpi),
+        DpiValues::Range {
+            minimum,
+            maximum,
+            step,
+        } => {
+            *step != 0
+                && minimum <= maximum
+                && dpi >= *minimum
+                && dpi <= *maximum
+                && (dpi - minimum).is_multiple_of(*step)
+        }
+    }
+}
+
+/// Returns the closest value the device reports as writable. Equal-distance
+/// ties select the higher DPI so the result is deterministic.
+pub fn nearest_supported_dpi(values: &DpiValues, requested: u16) -> Option<u16> {
+    match values {
+        DpiValues::List(values) => values
+            .iter()
+            .min_by_key(|value| {
+                (
+                    u16::abs_diff(**value, requested),
+                    std::cmp::Reverse(**value),
+                )
+            })
+            .copied(),
+        DpiValues::Range {
+            minimum,
+            maximum,
+            step,
+        } => {
+            if *step == 0 || minimum > maximum {
+                return None;
+            }
+            if requested <= *minimum {
+                return Some(*minimum);
+            }
+            let last = minimum + ((maximum - minimum) / step) * step;
+            if requested >= last {
+                return Some(last);
+            }
+            let offset = requested - minimum;
+            let lower = minimum + (offset / step) * step;
+            let upper = lower + step;
+            if requested - lower < upper - requested {
+                Some(lower)
+            } else {
+                Some(upper)
+            }
+        }
+    }
+}
+
 pub fn parse_sensor_count(data: &[u8]) -> Result<u8, Error> {
     let count = data
         .first()
@@ -118,6 +222,84 @@ pub fn parse_sensor_dpi(sensor: u8, supported: DpiValues, data: &[u8]) -> Result
         default,
         supported,
     })
+}
+
+fn read_current(
+    transport: &mut impl Exchange,
+    device: u8,
+    feature: Feature,
+    sensor: u8,
+    supported: DpiValues,
+) -> Result<SensorDpi, Error> {
+    let response = hidpp::read_only_exchange(transport, device, feature.index, 2, &[sensor])
+        .map_err(|error| error.in_read("0x2201 DPI write read-back (fn2)"))?;
+    parse_sensor_dpi(sensor, supported, &response)
+}
+
+/// Sends exactly one setSensorDpi request, then verifies it with an independent
+/// read-only fn2 request. A write timeout is ambiguous and is never retried.
+pub fn set_and_verify(
+    transport: &mut impl Exchange,
+    device: u8,
+    feature: Feature,
+    sensor_count: u8,
+    sensor: &SensorDpi,
+    requested: u16,
+) -> Result<SetDpiOutcome, SetDpiError> {
+    if feature.id != 0x2201 {
+        return Err(SetDpiError::InvalidFeature);
+    }
+    if sensor_count == 0 || sensor.sensor >= sensor_count {
+        return Err(SetDpiError::InvalidSensor);
+    }
+    if !supports_dpi(&sensor.supported, requested) {
+        return Err(SetDpiError::Unsupported {
+            requested,
+            nearest: nearest_supported_dpi(&sensor.supported, requested),
+        });
+    }
+
+    let [high, low] = requested.to_be_bytes();
+    let write = transport.exchange(device, feature.index, 3, &[sensor.sensor, high, low]);
+    let acknowledged = match write {
+        Ok(response) => {
+            if feature.version > 0
+                && response.get(..3) != Some([sensor.sensor, high, low].as_slice())
+            {
+                return Err(SetDpiError::Write(Error::Malformed(
+                    "DPI setter acknowledgement mismatch",
+                )));
+            }
+            true
+        }
+        Err(Error::Timeout) => false,
+        Err(error) => return Err(SetDpiError::Write(error)),
+    };
+
+    match read_current(
+        transport,
+        device,
+        feature,
+        sensor.sensor,
+        sensor.supported.clone(),
+    ) {
+        Ok(current) if acknowledged && current.current == requested => {
+            Ok(SetDpiOutcome::Verified {
+                current: current.current,
+            })
+        }
+        Ok(current) if acknowledged => Ok(SetDpiOutcome::AcknowledgedMismatch {
+            actual: current.current,
+        }),
+        Err(error) if acknowledged => Ok(SetDpiOutcome::AcknowledgedUnverified { error }),
+        Ok(current) if current.current == requested => Ok(SetDpiOutcome::TimedOutConfirmed {
+            current: current.current,
+        }),
+        Ok(current) => Ok(SetDpiOutcome::TimedOutDifferent {
+            actual: current.current,
+        }),
+        Err(error) => Ok(SetDpiOutcome::TimedOutUnverified { error }),
+    }
 }
 
 pub fn read(

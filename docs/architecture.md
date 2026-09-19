@@ -1,9 +1,10 @@
 ﻿# Architecture
 
-LogiPeek is a one-shot native Rust CLI with a narrow HID abstraction. It deliberately does not use a web UI, browser runtime, Electron, WebView, Node.js, or a background service: these would add deployment size, dependencies, and persistent activity without helping a short hardware diagnostic.
+LogiPeek is a one-shot native Rust CLI with a narrow HID abstraction. It is read-focused and permits one explicit runtime DPI command. It deliberately does not use a web UI, browser runtime, Electron, WebView, Node.js, or a background service: these would add deployment size, dependencies, and persistent activity without helping a short hardware operation.
 
 ```text
 CLI → discovery → transport → HID++ protocol → features → battery / DPI reporting
+                                                     └→ validated runtime DPI write
 ```
 
 `main` parses a single mode, invokes `device::scan`, and renders user-facing results. The library forbids unsafe code.
@@ -12,7 +13,7 @@ CLI → discovery → transport → HID++ protocol → features → battery / DP
 - `hid::transport` performs one physical HID++ request and one bounded response wait over an opened interface, including Windows zero-padded input handling. It never retries a request.
 - `hid::hidpp` strictly parses short (`0x10`, 7-byte) and long (`0x11`, 20-byte) protocol packets, classifies errors, probes HID++ versions, and discovers features.
 - `hid::features::battery` detects `0x1000`, `0x1001`, and `0x1004`. It reads `0x1004` capabilities/status and retains the `0x1000` version 0 reader as a fallback.
-- `hid::features::dpi` detects `0x2201` and `0x2202` and implements the read-only `0x2201` sensor count, supported-values, and current/default queries. It contains no write operation.
+- `hid::features::dpi` detects `0x2201` and `0x2202`, implements the `0x2201` sensor count, supported-values, and current/default queries, and exposes the narrowly scoped function 3 runtime setter used only after CLI preflight.
 
 ## Capability-first discovery
 
@@ -28,7 +29,7 @@ A successful ping identifies HID++ 2.x feature protocol or HID++ 1.x. HID++ 1.x 
 
 The transport makes one request at a time and rotates software ID values `1..15` per request. After the write returns, it gives matching replies a 750 ms deadline and consumes at most 128 reports. The 750 ms bound applies to reply waiting, not the entire exchange: the Windows backend write can itself take up to about one second. The transport ignores unrelated notifications and replies, matches device, feature, function, and software ID, and exposes transport, timeout, malformed-response, and protocol errors rather than panicking.
 
-`hidpp::read_only_exchange` is an explicit recovery layer for idempotent reads. It permits two attempts and retries only Timeout, HID++ 1.x Busy `0x07`, or HID++ 2.x Busy `0x08`. Every attempt calls the transport separately and therefore gets a new nonzero software ID. Generic exchanges do not retry, so a future setter cannot be repeated after an ambiguous timeout unless a caller explicitly violates the read-only API contract.
+`hidpp::read_only_exchange` is an explicit recovery layer for idempotent reads. It permits two attempts and retries only Timeout, HID++ 1.x Busy `0x07`, or HID++ 2.x Busy `0x08`. Every attempt calls the transport separately and therefore gets a new nonzero software ID. The DPI setter bypasses this helper and calls the generic exchange exactly once, so an ambiguous timeout, Busy response, I/O failure, malformed response, or acknowledgement mismatch can never resend the write.
 
 Windows may return a short HID++ input report padded with zero bytes to the collection's maximum input size. `transport::parse_input` accepts only zero padding up to 64 bytes, then passes the exact report slice to the strict `Packet::parse` parser.
 
@@ -38,10 +39,18 @@ Software IDs are not exclusive. Another client can use the interface, and an app
 
 Feature discovery reports `0x1000`, `0x1001`, and `0x1004`. A discovered `0x1004` is preferred because it can report a percentage, coarse level, charging state, and rechargeable capability; the `0x1000` version 0 reader remains the fallback. Percentage and coarse level remain separate optional values, so no coarse level is converted into an invented percentage. The fourth `0x1004` status byte is retained as an external-power indicator only in raw form because the public material consulted does not define its values. `0x1001` remains detection-only.
 
-For `0x2201`, the reader asks for the sensor count and then reads each sensor's supported DPI representation and current/default DPI. Supported values remain a discrete list or a compact range with a step; the parser does not expand ranges. Device-reported sensor counts are bounded defensively. `0x2202` remains detection-only. No setter, function 3 request, preset, or DPI write API exists.
+## DPI semantics and write boundary
+
+For `0x2201`, the reader asks for the sensor count and then reads each sensor's supported DPI representation and current/default DPI. Supported values remain a discrete list or a compact range with a step; the parser does not expand ranges. Device-reported sensor counts are bounded defensively. `0x2202` remains detection-only.
+
+`--set-dpi <DPI>` starts a fresh discovery and preflight instead of reusing earlier CLI output or a persistent cache. The write is allowed only when that scan finds exactly one responding endpoint with `0x2201` and its function 0 reports exactly one sensor. This intentionally rejects ambiguous multi-endpoint and multi-sensor configurations rather than guessing a target.
+
+The requested DPI must be exact. For a discrete list it must equal one listed value. For a range it must lie between the inclusive bounds and satisfy `(value - minimum) % step == 0`. The command never rounds or clamps. Rejected values include a nearest supported suggestion; if two values are equally distant, the higher value wins. Suggestion calculation does not authorize a write.
+
+After validation, function 3 receives `[sensor index, DPI MSB, DPI LSB]` through one direct generic exchange. Version 1 and later responses must echo the same sensor index and big-endian DPI; version 0 is allowed to acknowledge without echoing those parameters. A function 2 readback follows a valid acknowledgement or setter Timeout and may use the read-only retry policy, but no readback result can trigger another write. A valid acknowledgement plus a matching readback is verified; a different or failed readback is acknowledged but unverified. After setter Timeout, a matching readback confirms the currently observed value, while a different or unavailable readback remains ambiguous. Non-timeout protocol or I/O errors, malformed responses, and acknowledgement echo mismatches return immediately without readback. None of these paths repeats function 3.
 
 ## Boundaries and future work
 
-There is no runtime network activity, account, telemetry, persistence, service, or background polling. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
+There is no runtime network activity, account, telemetry, persistence, service, or background polling. The function 3 command changes only the active runtime DPI exposed by `0x2201`; it does not save a preset, profile, onboard setting, or startup configuration. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
 
-Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. Additional battery formats may be added only after validation. DPI writes, profiles, RGB, macros, remapping, model databases, GUI/tray behavior, startup registration, and updates remain outside this phase.
+Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. Additional battery formats may be added only after validation. DPI presets, persistence, profiles, `0x2202` writes, RGB, macros, remapping, model databases, GUI/tray behavior, startup registration, and updates remain outside this phase.

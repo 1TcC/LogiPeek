@@ -28,7 +28,7 @@ The implementation keeps four kinds of evidence separate:
 - **Official public material.** Logitech’s [cpg-docs HID++ 2.0](https://github.com/Logitech/cpg-docs/tree/master/hidpp20) defines the packet model and dynamic feature discovery, including [0x0000 IRoot](https://github.com/Logitech/cpg-docs/blob/master/hidpp20/features/0x0000-IRoot.rst). Public mirrors of Logitech’s [HID++ 1.x receiver specification](https://lekensteyn.nl/files/logitech/logitech_hidpp10_specification_for_Unifying_Receivers.pdf) and [HID++ 2.0 specification draft](https://lekensteyn.nl/files/logitech/logitech_hidpp_2.0_specification_draft_2012-06-04.pdf) document the error codes and `0x1000`. The public mirror of Logitech’s [`0x2201` Adjustable DPI feature](https://lekensteyn.nl/files/logitech/x2201_adjustabledpi.html) documents sensor count, the DPI list/range encoding, current/default DPI, and the separate write function.
 - **Permissively licensed implementation cross-check.** The [`0x1004` Unified Battery](https://openlogi.org/hidpp/features/x1004-unified-battery) and [`0x2201` Adjustable DPI](https://openlogi.org/hidpp/features/x2201-adjustable-dpi) references from OpenLogi were used to cross-check request functions and response layout. OpenLogi is MIT/Apache-2.0 and its HID++ crate is 0BSD. LogiPeek implements its own parsers and transport behavior.
 - **Real hardware observation.** The table above records the receiver interfaces, endpoint results, protocol 4.2 response, and dynamically returned feature versions seen on one Windows setup. Feature indices are never copied from the observation; they are resolved with IRoot on every run.
-- **Still uncertain.** Public material identifies byte 3 of the `0x1004` status response as an external-power-source indicator but does not define its value meanings. LogiPeek therefore preserves it only as a raw byte and does not claim that it means connected or disconnected. Publicly mirrored `0x2201` documentation covers versions 0 and 1, while the observed device reports version 2; LogiPeek uses only the documented base read functions and does not infer new version-2 fields. Bluetooth, direct USB mice, other receivers, and additional devices remain unverified until separately observed.
+- **Still uncertain.** Public material identifies byte 3 of the `0x1004` status response as an external-power-source indicator but does not define its value meanings. LogiPeek therefore preserves it only as a raw byte and does not claim that it means connected or disconnected. Publicly mirrored `0x2201` documentation covers versions 0 and 1, while the observed device reports version 2; LogiPeek confines version 2 handling to the documented base functions and layouts, including function 3, and does not infer new version-2 fields. Bluetooth, direct USB mice, other receivers, and additional devices remain unverified until separately observed.
 
 The Linux HID++ driver was consulted only as a behavior cross-check for `0x1004` and transport behavior; no GPL implementation code is copied into this MIT project.
 
@@ -60,15 +60,16 @@ The parser requires at least two capability bytes and four information bytes. It
 
 For `0x1000` version 0, LogiPeek continues to call function `1` for capabilities and function `0` for status. It requires at least two capability bytes and three status bytes. Exact percentage output depends on capability flags; without a percentage/mileage indication it reports a coarse level. Other `0x1000` versions are not read.
 
-## DPI reads
+## DPI reads and runtime write
 
-The read path supports `0x2201`; `0x2202` remains detection-only. LogiPeek calls only these documented `0x2201` read functions:
+The read path and narrowly scoped runtime setter support `0x2201`; `0x2202` remains detection-only. LogiPeek uses only these documented `0x2201` functions:
 
 | Function | Request purpose | Parsed result |
 | --- | --- | --- |
 | `0` | `getSensorCount` | Number of motion sensors |
 | `1` | `getSensorDpiList(sensorIdx)` | Per-sensor supported discrete values or a range |
 | `2` | `getSensorDpi(sensorIdx)` | Echoed sensor index, current DPI, and optional default DPI |
+| `3` | `setSensorDpi(sensorIdx, dpi)` | One runtime DPI change after unique-target and value validation |
 
 Sensor count must be between 1 and 16, which bounds device-controlled work. Each sensor index from zero to count minus one is queried separately, and both function `1` and function `2` must echo the requested index.
 
@@ -76,7 +77,29 @@ Function `1` values are big-endian `u16`. Zero terminates the list. Values `1..=
 
 Function `2` accepts current and default DPI only in `1..=0xDFFF`; a zero default is represented as unavailable because feature version 0 reports no default. Current/default values are not invented from the supported range.
 
-No code path calls `0x2201` function `3`, and LogiPeek does not implement a DPI setter. It does not scan unknown functions, send candidate DPI values, change profiles, or write receiver/device settings.
+The public `0x2201` document covers feature versions 0 and 1. The observed device reports version 2, so LogiPeek uses only the same base function numbers and payload layouts and does not invent version-2 fields. This compatibility assumption is kept separate from hardware evidence.
+
+### `--set-dpi` safety preflight
+
+`--set-dpi <DPI>` performs a fresh scan for every invocation. It does not reuse a previous `--devices` or `--dpi` result and has no global cache. Before any write, the scan must produce exactly one responding endpoint that exposes `0x2201`, and function 0 on that endpoint must report exactly one sensor. Zero or multiple matching endpoints, or any sensor count other than one, abort without sending function 3.
+
+The command reads the supported representation before writing. A discrete list authorizes only exact members. A range authorizes only values within its inclusive bounds for which `(requested - minimum) % step == 0`. Values are never rounded or clamped. When the value is unsupported, LogiPeek suggests the nearest valid value; an equal-distance tie resolves upward. This suggestion is informational and the rejected invocation sends no write.
+
+### Function 3 request and acknowledgement
+
+The function 3 payload is exactly three meaningful bytes: byte 0 is sensor index `0`; bytes 1 and 2 are the requested DPI as a big-endian `u16`. It is sent through `Exchange::exchange`, never `read_only_exchange`. There is exactly one physical function 3 attempt, including after Timeout, HID++ Busy, I/O failure, a malformed reply, or an acknowledgement mismatch.
+
+For feature version 1 and later, the public specification says the response echoes the sensor index and DPI in the same three-byte layout; LogiPeek requires that echo to match. Version 0 does not echo these parameters, so a strictly matched successful protocol response is its acknowledgement. No other response parameter is interpreted.
+
+After a valid acknowledgement or setter Timeout, a function 2 readback is safe because it cannot repeat or change the DPI. Readback can use the bounded read-only retry policy. Non-timeout protocol or I/O errors, malformed responses, and wrong echoes return immediately without readback. The outcomes remain explicit:
+
+- a valid acknowledgement followed by the requested readback is verified success;
+- an explicit HID++ protocol error returns immediately as a rejected write;
+- a valid acknowledgement followed by a different value or failed readback means the write was acknowledged but the final state is not verified;
+- after setter Timeout, a matching readback confirms that the requested value is currently observed, while a different or unavailable readback leaves the outcome ambiguous;
+- an I/O failure, malformed response, or wrong echo is reported immediately and does not cause a speculative readback.
+
+None of these outcomes triggers a second function 3 request. The change is runtime-only: LogiPeek does not persist a preset, alter an onboard profile, write `0x2202`, scan unknown functions, or promise that the value survives reconnection, profile changes, device reset, or another application's changes.
 
 ## Timing and uncertainty
 
@@ -84,7 +107,7 @@ No code path calls `0x2201` function `3`, and LogiPeek does not implement a DPI 
 
 Each generic exchange remains one physical request followed by one bounded wait; it never resends automatically. Once the write completes, a matching reply has a 750 ms deadline and at most 128 reports are processed. This replaces the original 350 ms policy, which provided less margin than mature implementations and the observed receiver path warranted. The Windows backend write can itself take up to about one second, so 750 ms is not a bound on the entire exchange.
 
-Only explicitly read-only calls use `read_only_exchange`. They make at most two attempts and retry only Timeout, HID++ 1.x Busy `0x07`, or HID++ 2.x Busy `0x08`. I/O errors, malformed responses, unsupported/invalid arguments, out-of-range errors, invalid feature/function errors, and every other protocol code return immediately. Battery GETs, DPI GETs, root feature discovery, and protocol ping use this helper. No setter exists, and generic exchange behavior remains safe for future writes.
+Only explicitly read-only calls use `read_only_exchange`. They make at most two attempts and retry only Timeout, HID++ 1.x Busy `0x07`, or HID++ 2.x Busy `0x08`. I/O errors, malformed responses, unsupported/invalid arguments, out-of-range errors, invalid feature/function errors, and every other protocol code return immediately. Battery GETs, DPI GETs, root feature discovery, protocol ping, and the post-write DPI readback use this helper. The DPI setter calls generic exchange directly once and never inherits read retry behavior.
 
 Every physical attempt rotates to a new nonzero software ID. Matching remains strict on device index, feature index, function, and software ID. A late reply for the first attempt is ignored while the retry waits for its own software ID. Input is not drained, so notifications and unrelated application traffic are ignored through matching rather than destructively discarded.
 
@@ -96,6 +119,12 @@ With the 750 ms window and two read-only attempts, `--devices` reached slot `0x0
 
 One complete `--dpi` run succeeded: sensor count 1; sensor 0 current DPI 1300; default DPI 800; supported range 100–25600; step 50. Two later DPI runs and a following device probe timed out before fn0 because slot `0x01` was no longer responding. The successful sample validates the implemented fn0/fn1/fn2 sequence and parsers on this device. The failed samples show that forwarded-endpoint availability remains intermittent and is distinct from a DPI read-stage error.
 
+These Phase 2.5 observations were read-only. They do not by themselves claim that function 3 has been physically verified on the observed version-2 device; any Phase 3 write observation must be recorded separately with its acknowledgement and readback outcome.
+
 A `logi_lamparray_service` process was present, but no G HUB application process was found. The service could not be stopped without administrator access, so this run did not establish whether it contributes concurrent HID++ traffic. No security setting or service configuration was changed.
+
+### Phase 3 hardware observation
+
+On 2026-09-19, the final Phase 3 read-only preflight again enumerated the `046D:C547` receiver. Usage 1 exposed only the HID++ 1.x endpoint at `0xFF`; usage 2 had no responding endpoint, so the fresh `--dpi` command could not obtain a current value, supported representation, or step. The required preflight therefore did not authorize `--set-dpi`: no function 3 request was sent, no physical DPI change was claimed, and no restore was necessary. `logi_lamparray_service` remained present throughout this observation and was not stopped, killed, or reconfigured.
 
 Software ID rotation is not exclusive: input can be stale and other software can concurrently send HID++ traffic. IDs are four bits and repeat after 15 requests, which is a protocol-space limitation. Disconnects, sleep, permissions, malformed data, unsupported features, and timeouts become explicit errors. The hardware observation above validates one Windows USB receiver setup only; Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.

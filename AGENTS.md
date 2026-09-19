@@ -21,7 +21,7 @@
 - Keep diagnostics safe to share: no usernames, home paths, serial numbers, MAC/IP addresses, or full HID paths.
 - Do not claim hardware compatibility or validation without actual physical testing. Clearly separate implemented features from verified behavior.
 - Avoid busy polling. LogiPeek uses one-shot CLI queries.
-- The current phase excludes GUI, tray, DPI writes/presets, startup registration, auto updates, RGB, macros, remapping, and onboard profile changes.
+- The current phase permits only the explicitly authorized, one-shot runtime `0x2201` function 3 DPI write after fresh unique-target and supported-value validation. It still excludes DPI presets, persistence, `0x2202` writes, GUI, tray, startup registration, auto updates, RGB, macros, remapping, and onboard profile changes.
 
 ## Collaboration
 - Use a small number of independent sub-agents where useful; do not delegate merely for the sake of delegation.
