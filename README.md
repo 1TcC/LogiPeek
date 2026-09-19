@@ -4,17 +4,17 @@ English | [简体中文](README.zh-CN.md)
 
 ## What is LogiPeek?
 
-LogiPeek is a small, unofficial Windows tray and command-line tool that inspects Logitech HID++ interfaces and reports the battery and DPI capabilities they expose. It runs entirely on the local machine.
+LogiPeek is a lightweight native Windows tray application with a compact settings window and CLI diagnostics for Logitech HID++ battery and DPI capabilities. It runs entirely on the local machine.
 
 ## Motivation
 
-It is for people who want a lightweight way to inspect mouse battery and DPI capabilities without installing a complete device suite. It is not a full replacement for Logitech G HUB: it has no profiles, remapping, RGB, macros, main GUI window, background service, or persistent configuration. Its only configuration action is a validated runtime DPI change.
+It is for people who want a lightweight way to view mouse battery state and control runtime DPI without installing a complete device suite. It is not a full replacement for Logitech G HUB: it has no profiles, remapping, RGB, macros, background service, cloud account, or onboard-memory editor.
 
 ## Status and goals
 
-This is an early, read-focused foundation with one narrowly scoped write. With no arguments it starts a native Windows notification-area process; CLI arguments still perform one operation and exit. Both modes use the same `0x2201` function 3 setter after a fresh safety preflight. One receiver setup was exercised on Windows on 2026-09-19; see the [hardware observation](docs/hidpp.md#baseline-hardware-observation). It does not claim model support or broad receiver compatibility. Real `0x1004` battery and `0x2201` DPI reads succeeded on that setup, although forwarded-slot availability remained intermittent.
+With no arguments LogiPeek starts its native notification-area process and opens a compact settings window. CLI arguments still perform one operation and exit. The GUI, tray, and CLI share the same `0x2201` function 3 setter after a fresh safety preflight. One receiver setup was exercised on Windows on 2026-09-19; see the [hardware observation](docs/hidpp.md#baseline-hardware-observation). It does not claim model support or broad receiver compatibility, and forwarded-slot availability remains intermittent.
 
-Designed to support as many Logitech mice as practical through HID++ capability discovery. The automated suite contains 34 protocol tests and 5 tray-state tests.
+Designed to support as many Logitech mice as practical through HID++ capability discovery. The automated suite contains 34 protocol tests plus state, settings, and slider tests.
 
 ## Current features
 
@@ -30,6 +30,11 @@ Designed to support as many Logitech mice as practical through HID++ capability 
 - Provides `--devices`, `--diag`, `--battery`, `--dpi`, and `--set-dpi <DPI>` as one-shot commands.
 - Starts a native Win32 tray when run without arguments. Its menu shows current battery/DPI state, Refresh, Exit, and fixed 400/800/1600/3200 DPI choices. Unsupported choices stay visible but disabled, and the current choice is checked when it matches.
 - Refreshes battery state every 60 seconds on one blocking HID worker. DPI is read at startup, after a tray write, and on manual Refresh. A named mutex prevents duplicate tray instances without blocking CLI commands.
+- Shows a fixed-size, Per-Monitor-DPI-aware native Win32 settings window with battery state, a progress bar when exact percentage exists, current DPI, a capability-driven slider, four presets, inline operation status, and Refresh.
+- Supports both discrete DPI lists and stepped ranges. Dragging updates only a pending preview; releasing commits at most one write through the same safe setter and returns to the hardware value after failure.
+- Lets users edit four preset slots and choose System, Light, or Dark appearance. Presets unsupported by the current device remain saved but disabled.
+- Stores tolerant, human-readable settings in `%LOCALAPPDATA%\LogiPeek\settings.ini` using a synced temporary file and atomic same-volume replacement. No registry or database is used.
+- Closing the settings window hides it to the tray. `Open LogiPeek` or tray activation shows the same window again; Tray Exit performs clean shutdown.
 
 ## Compatibility and limits
 
@@ -65,7 +70,9 @@ cargo run -- --dpi
 cargo run -- --set-dpi 1600
 ```
 
-Run `cargo run` with no arguments to start the tray. The fixed presets are not saved as settings, and a selected DPI remains a runtime device value only.
+Run `cargo run` with no arguments to start the tray and settings window.
+
+The four presets and appearance choice are saved locally. DPI changes remain runtime-only device values and are not written to onboard profiles.
 
 The project uses `hidapi` with its `windows-native` backend. No runtime network access is required.
 
@@ -86,14 +93,14 @@ logipeek --help
 
 ## Privacy and performance
 
-LogiPeek has no accounts, telemetry, analytics, uploads, cloud calls, or background service. The tray uses the Win32 message wait plus one blocking worker queue; it does not busy-poll. The worker performs a battery refresh every 60 seconds and serializes all HID access. After a request is sent, the reply deadline is 750 ms and at most 128 incoming reports are processed. Explicit read-only operations may make one retry after Timeout or HID++ Busy; malformed data, I/O failures, and other protocol errors are returned immediately. The DPI setter always makes one physical write attempt. Diagnostics omit serial numbers and full HID paths.
+LogiPeek has no accounts, telemetry, analytics, uploads, cloud calls, runtime network requests, or background service. The Win32 UI repaints only on state/input changes. The tray uses the message wait plus one blocking worker queue; it does not busy-poll. The worker performs a battery refresh every 60 seconds and serializes all HID access. The DPI setter always makes one physical write attempt per submitted command. Diagnostics omit serial numbers and full HID paths.
 
 ## Roadmap
 
 - Broaden validation beyond the observed Windows USB receiver setup to direct and Bluetooth devices.
 - Improve device/receiver interpretation only where protocol evidence supports it.
 - Add carefully validated reads for more battery formats and DPI data.
-- Add a separate main-window experience and user-defined presets in a future phase. Persistence, profiles, `0x2202` writes, RGB, macros, remapping, background services, startup registration, and updates remain outside the current phase.
+- Broaden native-window accessibility and hardware coverage. Profiles, `0x2202` writes, RGB, macros, remapping, background services, startup registration, notifications, device selection, and updates remain outside the current phase.
 
 ## Contributing
 

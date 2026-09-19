@@ -1,4 +1,7 @@
-use logipeek::app::state::{AppState, DEFAULT_PRESETS, DeviceStatus};
+use logipeek::app::{
+    settings::{Settings, Theme},
+    state::{AppState, DEFAULT_PRESETS, DeviceStatus, OperationStatus},
+};
 use logipeek::hid::{
     device::{Endpoint, FeatureResult, Interface},
     features::{
@@ -148,4 +151,39 @@ fn battery_scan_preserves_dpi_only_for_same_sole_target() {
     assert_eq!(state.status, DeviceStatus::Single);
     assert_eq!(state.current_dpi, None);
     assert_eq!(state.battery_percent, Some(40));
+}
+
+#[test]
+fn custom_presets_share_state_and_unsupported_values_are_disabled() {
+    let mut state = AppState::default();
+    state.status = DeviceStatus::Single;
+    state.current_dpi = Some(850);
+    state.supported_dpi = Some(DpiValues::Range {
+        minimum: 100,
+        maximum: 1600,
+        step: 50,
+    });
+    state.apply_settings(&Settings {
+        presets: [450, 850, 1700, 3200],
+        theme: Theme::Dark,
+    });
+    let presets = state.presets();
+    assert_eq!(state.theme, Theme::Dark);
+    assert!(presets[0].enabled);
+    assert!(presets[1].enabled && presets[1].checked);
+    assert!(!presets[2].enabled);
+    assert!(!presets[3].enabled);
+}
+
+#[test]
+fn operation_status_never_changes_current_dpi_preview_truth() {
+    let mut state = AppState::default();
+    state.current_dpi = Some(1300);
+    state.operation = OperationStatus::Applying(1350);
+    assert_eq!(state.current_dpi, Some(1300));
+    assert_eq!(state.operation_text(), "Applying 1350 DPI...");
+    state.operation = OperationStatus::Verified(1350);
+    assert_eq!(state.operation_text(), "Verified 1350 DPI");
+    state.operation = OperationStatus::Failed("DPI change failed".into());
+    assert_eq!(state.operation_text(), "DPI change failed");
 }

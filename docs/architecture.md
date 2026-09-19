@@ -1,17 +1,21 @@
 ﻿# Architecture
 
-LogiPeek is a native Rust Windows tray and one-shot CLI with a narrow HID abstraction. It is read-focused and permits one explicit runtime DPI write path. It deliberately does not use a GUI framework, web UI, browser runtime, Electron, WebView, Node.js, async runtime, database, or background service.
+LogiPeek is a native Rust Windows tray, compact settings window, and one-shot CLI with a narrow HID abstraction. It is read-focused and permits one explicit runtime DPI write path. It deliberately does not use a GUI framework, web UI, browser runtime, Electron, WebView, Node.js, async runtime, database, or background service.
 
 ```text
-native Win32 tray ─┐
-                   ├→ AppState → single HID worker → discovery → transport → HID++ → battery / DPI
-one-shot CLI ──────┘                                      └→ validated runtime DPI write
+Win32 tray + settings window ─┐
+                              ├→ shared AppState → single HID worker → HID++ battery / DPI
+one-shot CLI ─────────────────┘          ↑
+settings.ini → Settings Store ───────────┘
 ```
 
-`main` starts tray mode only when no arguments are present; every existing CLI argument still performs one operation and exits. The core library forbids unsafe code. Raw Win32 calls are isolated in the binary-only `app::tray` module, with documented unsafe blocks and no unsafe HID parsing.
+`main` starts tray plus settings-window mode only when no arguments are present; every existing CLI argument still performs one operation and exits. The core library forbids unsafe code. Raw Win32 calls are isolated in the binary-only `app::tray` and `app::window` modules, with documented unsafe blocks and no unsafe HID parsing.
 
 - `app::tray` owns the hidden top-level window, notification icon, popup menu, named single-instance mutex, and blocking Win32 message loop. A small original monochrome mouse icon is generated at startup, avoiding a binary asset. The process detaches its console only after tray initialization succeeds, so CLI output remains intact.
-- `app::state` converts scan results into a small UI snapshot. It exposes fixed 400/800/1600/3200 presets, enables only device-supported values, checks only an exact current match, and disables all writes when no unique target exists.
+- `app::window` owns one fixed-size, Per-Monitor-V2-aware Win32 settings window. It custom-draws cards, battery progress, slider, presets, appearance choices, and inline status only during `WM_PAINT`. Closing hides it; tray Open shows the same HWND.
+- `app::state` is the single hardware and UI truth consumed by tray and window. It stores device status, battery semantics, current/supported DPI, operation status, four presets, theme, and settings-save notice. Multiple usable targets disable all DPI controls.
+- `app::settings` is a tolerant std-only `key=value` parser and serializer. Missing files, malformed individual fields, and unknown keys fall back or are ignored without preventing startup.
+- `app::slider` provides pure list/range position conversion. Discrete lists map positions to indices; ranges use the existing nearest-supported rule, including higher-value tie breaking.
 - `app::worker` owns the only background thread and a bounded one-command queue. It serializes startup/manual scans, tray DPI writes, and the 60-second battery refresh. `recv_timeout` blocks between work items, and the UI thread blocks in `GetMessageW`; neither loop spins.
 
 - `hid::device` enumerates `hidapi` interfaces whose vendor ID is `0x046D`, sanitizes labels, opens only HID++ query candidates, attempts native report-descriptor reconstruction after a successful open, and retains every interface separately.
@@ -22,13 +26,25 @@ one-shot CLI ──────┘                                      └→ v
 
 ## Tray behavior and concurrency
 
-The tray menu is built from a locked clone of `AppState` and destroyed after each popup closes. Battery and DPI values therefore come only from completed hardware scans; failed full scans replace them with unavailable state instead of presenting stale data as current. A battery-only refresh retains DPI only when the same sole target is still present. Multiple usable targets produce an explicit multiple-device state and disable every preset.
+The tray menu and settings window render locked clones of the same `AppState`. Battery and DPI values therefore come only from completed hardware scans; failed full scans replace them with unavailable state instead of presenting stale data as current. A battery-only refresh retains DPI only when the same sole target is still present. Multiple usable targets produce an explicit multiple-device state and disable every preset.
 
 The worker executes `device::set_unique_runtime_dpi`, the same function used by `--set-dpi`. Every click therefore receives a fresh discovery/preflight, unique endpoint and single-sensor check, supported-value validation, one function 3 attempt, and the existing readback classification. The bounded queue prevents repeated clicks from creating an unbounded series of writes. The worker performs a full rescan after a write and posts a state-update message to the UI thread.
 
-The notification icon is re-added after Explorer broadcasts `TaskbarCreated`. Exit removes the icon, destroys the hidden window, stops and joins the worker, destroys the icon handle, unregisters the class, and releases the named mutex. A second no-argument process exits normally; CLI processes do not acquire this mutex.
+The notification icon is re-added after Explorer broadcasts `TaskbarCreated`. Exit hides/destroys the settings window, removes the icon, stops and joins the worker while its notification HWND remains valid, destroys the tray window and icon, unregisters both classes, and releases the named mutex. A second no-argument process exits normally; CLI processes do not acquire this mutex.
 
-The only new direct dependency is `windows-sys`, with the Foundation, GDI, Security, Console, LibraryLoader, Threading, Shell, and WindowsAndMessaging feature groups. It was already present transitively through the native HID backend; declaring it directly exposes the required raw Win32 APIs without a GUI framework or runtime.
+The only direct Windows dependency is `windows-sys`. Phase 5 adds only DWM, Storage/FileSystem, HiDPI, Input/IME, and KeyboardAndMouse feature groups to the existing Foundation, GDI, Security, Console, LibraryLoader, Threading, Shell, and WindowsAndMessaging set. The process disables IME only for its ASCII-numeric custom preset editor; this avoids third-party input-method injection without changing system configuration.
+
+## Settings window and slider commit
+
+All layout constants are 96-DPI logical units and are scaled with the window DPI. `WM_DPICHANGED` copies and applies the suggested rectangle, updates scaling, and invalidates the window. Light and Dark use small fixed palettes; System follows Win32 system window colors and theme-change messages. The DWM dark-title attribute is optional and failure is harmless.
+
+Slider capture starts on mouse down. Mouse movement updates only a `preview` value derived from `DpiValues`; it never sends HID traffic. Mouse release ends capture and can enqueue exactly one `SetDpi` command when preview differs from the last hardware current value. Capture loss cancels the preview. The worker performs the existing fresh preflight, at-most-once function 3 request, readback, and full refresh before publishing Verified or Failed state.
+
+Four custom numeric edit slots accept ASCII digits, Backspace, Tab, and Enter/Save Settings. Values are positive `u16` preferences; unsupported values may be saved but their tray/window buttons are disabled for the current device. There is no continuous render timer or animation loop.
+
+## Settings storage
+
+The runtime path is `%LOCALAPPDATA%\LogiPeek\settings.ini`. Fields are `preset1` through `preset4` and `theme=system|light|dark`. Saving writes, flushes, and syncs `settings.tmp`, then uses `MoveFileExW` with replace-existing and write-through flags for same-volume atomic replacement. A read or write failure leaves the application usable; write failure is reported inline. No registry, database, serializer crate, or network access is involved.
 
 ## Capability-first discovery
 
@@ -66,6 +82,6 @@ After validation, function 3 receives `[sensor index, DPI MSB, DPI LSB]` through
 
 ## Boundaries and future work
 
-There is no runtime network activity, account, telemetry, persistence, service, or busy polling. The tray's only periodic work is the 60-second battery refresh. Function 3 changes only the active runtime DPI exposed by `0x2201`; the four menu values are fixed choices rather than saved presets, profiles, onboard settings, or startup configuration. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
+There is no runtime network activity, account, telemetry, service, or busy polling. Persistence is limited to four preset values and appearance in the local settings file. The tray's only periodic work is the 60-second battery refresh. Function 3 changes only the active runtime DPI exposed by `0x2201`; presets are preferences rather than profiles, onboard settings, or startup configuration. Labels exclude controls and are length-limited; the CLI omits serial numbers and HID paths. On 2026-09-19, Windows testing exercised one USB receiver (`046D:C547`): six interfaces were enumerated, including two `FF00` candidates (usage 1 and 2); enumeration, protocol probes, and dynamic feature detection succeeded. This is a narrow observation, not identification of a mouse model or validation of receiver-family coverage. Bluetooth, direct USB mice, other receiver families, and other connection methods remain unverified.
 
-Future work begins with broader hardware validation and evidence-backed receiver/Bluetooth interpretation. A main GUI window, user-defined presets, persistence, profiles, `0x2202` writes, RGB, macros, remapping, model databases, startup registration, and updates remain outside this phase.
+Future work begins with broader hardware validation, evidence-backed receiver/Bluetooth interpretation, and incremental accessibility improvements. Device selection, profiles, `0x2202` writes, RGB, macros, remapping, model databases, startup registration, notifications, and updates remain outside this phase.

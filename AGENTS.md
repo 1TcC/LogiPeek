@@ -20,9 +20,10 @@
 - Do not copy GPL source into this MIT project. Prefer public Logitech protocol documentation and independent implementation.
 - Keep diagnostics safe to share: no usernames, home paths, serial numbers, MAC/IP addresses, or full HID paths.
 - Do not claim hardware compatibility or validation without actual physical testing. Clearly separate implemented features from verified behavior.
-- Keep the tray native to Windows; do not add a web or cross-platform GUI framework. Background work must block or wait rather than busy-poll, and all HID operations must run serially through one worker.
-- The tray may expose the fixed runtime DPI presets `400`, `800`, `1600`, and `3200`, but only after current capability validation. CLI and tray writes must share the same fresh unique-target, supported-value, at-most-once `0x2201` function 3 path.
-- Persistence, custom presets, `0x2202` writes, a main GUI window, startup registration, auto updates, RGB, macros, remapping, and onboard profile changes remain excluded.
+- Keep the tray and compact settings window native to Win32; do not add a web, cross-platform GUI, or continuous rendering loop. Background work must block or wait rather than busy-poll, and all HID operations must run serially through one worker.
+- CLI, tray presets, settings presets, and the DPI slider must share the same fresh unique-target, supported-value, at-most-once `0x2201` function 3 path. Slider movement only previews; gesture completion may submit at most one write.
+- Tray and GUI share one `AppState`. Settings remain local, use a tolerant parser, and must never prevent startup when missing or malformed.
+- `0x2202` writes, startup registration, notifications, auto updates, device selection, RGB, macros, remapping, and onboard profile changes remain excluded.
 
 ## Collaboration
 - Use a small number of independent sub-agents where useful; do not delegate merely for the sake of delegation.

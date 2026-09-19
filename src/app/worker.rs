@@ -1,5 +1,8 @@
-use super::state::AppState;
-use crate::hid::device::{self, ScanOptions};
+use super::state::{AppState, OperationStatus};
+use crate::hid::{
+    device::{self, ScanOptions},
+    features::dpi::SetDpiOutcome,
+};
 use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
@@ -56,8 +59,31 @@ fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: i
         match receiver.recv_timeout(BATTERY_REFRESH_INTERVAL) {
             Ok(Command::RefreshAll) => refresh_all(&state),
             Ok(Command::SetDpi(value)) => {
-                let _ = device::set_unique_runtime_dpi(value);
+                let result = device::set_unique_runtime_dpi(value);
                 refresh_all(&state);
+                if let Ok(mut current) = state.lock() {
+                    current.operation = match result {
+                        Ok(report) => match report.outcome {
+                            SetDpiOutcome::Verified { current }
+                            | SetDpiOutcome::TimedOutConfirmed { current } => {
+                                OperationStatus::Verified(current)
+                            }
+                            SetDpiOutcome::AcknowledgedMismatch { actual }
+                            | SetDpiOutcome::TimedOutDifferent { actual } => {
+                                OperationStatus::Failed(format!(
+                                    "DPI remains {actual}; requested value was not verified"
+                                ))
+                            }
+                            SetDpiOutcome::AcknowledgedUnverified { .. }
+                            | SetDpiOutcome::TimedOutUnverified { .. } => {
+                                OperationStatus::Failed("DPI change could not be verified".into())
+                            }
+                        },
+                        Err(_) => OperationStatus::Failed(
+                            "DPI change failed; refresh the device and try again".into(),
+                        ),
+                    };
+                }
             }
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => refresh_battery(&state),
@@ -67,14 +93,20 @@ fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: i
 }
 
 fn refresh_all(state: &Mutex<AppState>) {
-    let next = device::scan(ScanOptions {
+    let result = device::scan(ScanOptions {
         read_battery: true,
         read_dpi: true,
-    })
-    .map(|interfaces| AppState::from_scan(&interfaces))
-    .unwrap_or_default();
+    });
     if let Ok(mut current) = state.lock() {
-        *current = next;
+        match result {
+            Ok(interfaces) => current.replace_from_scan(&interfaces),
+            Err(_) => {
+                let settings = current.settings();
+                let mut replacement = AppState::default();
+                replacement.apply_settings(&settings);
+                *current = replacement;
+            }
+        }
     }
 }
 
@@ -84,7 +116,14 @@ fn refresh_battery(state: &Mutex<AppState>) {
         read_dpi: false,
     }) else {
         if let Ok(mut current) = state.lock() {
-            *current = AppState::default();
+            let settings = current.settings();
+            let operation = current.operation.clone();
+            let notice = current.settings_notice.clone();
+            let mut replacement = AppState::default();
+            replacement.apply_settings(&settings);
+            replacement.operation = operation;
+            replacement.settings_notice = notice;
+            *current = replacement;
         }
         return;
     };

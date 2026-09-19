@@ -2,6 +2,9 @@
 #[cfg(windows)]
 #[path = "app/tray.rs"]
 mod tray;
+#[cfg(windows)]
+#[path = "app/window.rs"]
+mod window;
 use logipeek::hid::{
     device::{self, Endpoint, ScanOptions},
     features::{

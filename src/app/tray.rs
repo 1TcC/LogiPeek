@@ -1,12 +1,16 @@
 use logipeek::app::{
-    state::AppState,
+    settings::Settings,
+    state::{AppState, OperationStatus},
     worker::{Command, Worker},
 };
 use std::{
     cell::Cell,
+    env,
     ffi::c_void,
     mem::size_of,
+    os::windows::ffi::OsStrExt,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{Arc, Mutex},
 };
@@ -15,11 +19,15 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
         POINT, WPARAM,
     },
+    Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
     System::{Console::FreeConsole, LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
+        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+        Input::Ime::ImmDisableIME,
         Shell::{
             NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-            NIM_SETFOCUS, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
+            NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+            Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
@@ -28,7 +36,7 @@ use windows_sys::Win32::{
             MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
             SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
             TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP, WM_CLOSE, WM_COMMAND,
-            WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP,
+            WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP,
             WNDCLASSW, WS_EX_TOOLWINDOW,
         },
     },
@@ -39,11 +47,20 @@ const MUTEX_NAME: &str = "Local\\LogiPeek.Tray.5DF85F89-74D5-4F19-AEEC-44483F2D3
 const ICON_ID: u32 = 1;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_STATE_UPDATED: u32 = WM_APP + 2;
+const OPEN_ID: u32 = 90;
 const PRESET_FIRST: u32 = 100;
 const REFRESH_ID: u32 = 200;
 const EXIT_ID: u32 = 201;
 
 pub fn run() -> Result<(), String> {
+    unsafe {
+        // SAFETY: This runs before either application window is created. A false return can
+        // mean awareness was already fixed by the host or manifest, so graceful fallback is safe.
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // SAFETY: LogiPeek accepts ASCII digits only and disables IME for this process's UI
+        // threads; this does not change the user's system input-method configuration.
+        ImmDisableIME(u32::MAX);
+    }
     let mutex = SingleInstance::acquire()?;
     let Some(mutex) = mutex else {
         return Ok(());
@@ -108,13 +125,22 @@ pub fn run() -> Result<(), String> {
             return Err(error);
         }
     };
-    let state = Arc::new(Mutex::new(AppState::default()));
-    let mut context = Box::new(TrayContext {
+    let settings_path = settings_path();
+    let settings = settings_path
+        .as_deref()
+        .map(Settings::load)
+        .unwrap_or_default();
+    let mut initial_state = AppState::default();
+    initial_state.apply_settings(&settings);
+    let state = Arc::new(Mutex::new(initial_state));
+    let mut context = Box::new(AppContext {
         state: Arc::clone(&state),
         worker: None,
         hwnd,
+        main_hwnd: Cell::new(null_mut()),
         icon,
         icon_added: Cell::new(false),
+        settings_path,
         taskbar_created: unsafe {
             // SAFETY: The string is NUL-terminated and valid for this call.
             RegisterWindowMessageW(taskbar_created_name.as_ptr())
@@ -125,7 +151,7 @@ pub fn run() -> Result<(), String> {
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
-            (&mut *context as *mut TrayContext) as isize,
+            (&mut *context as *mut AppContext) as isize,
         );
     }
     if !context.add_icon() {
@@ -144,6 +170,17 @@ pub fn run() -> Result<(), String> {
             return Err(format!("Could not start HID worker: {error}"));
         }
     };
+    let main_window = match crate::window::MainWindow::create(instance, &context) {
+        Ok(window) => window,
+        Err(error) => {
+            if let Some(worker) = context.worker.take() {
+                worker.shutdown();
+            }
+            context.cleanup_window(class_name.as_ptr(), instance);
+            return Err(error);
+        }
+    };
+    main_window.show();
     unsafe {
         // SAFETY: Detaching affects only this successfully initialized no-argument tray process.
         FreeConsole();
@@ -166,12 +203,15 @@ pub fn run() -> Result<(), String> {
         }
     };
 
+    main_window.destroy();
     context.remove_icon();
     if let Some(worker) = context.worker.take() {
         worker.shutdown();
     }
     unsafe {
-        // SAFETY: The icon was created by CreateIcon and remains owned by this process.
+        // SAFETY: The UI thread owns both resources; DestroyWindow is harmless if destruction
+        // already completed, and the icon was created by CreateIcon.
+        DestroyWindow(context.hwnd);
         DestroyIcon(context.icon);
         UnregisterClassW(class_name.as_ptr(), instance);
     }
@@ -183,16 +223,18 @@ pub fn run() -> Result<(), String> {
     }
 }
 
-struct TrayContext {
+pub(crate) struct AppContext {
     state: Arc<Mutex<AppState>>,
     worker: Option<Worker>,
     hwnd: HWND,
+    main_hwnd: Cell<HWND>,
     icon: HICON,
     icon_added: Cell<bool>,
+    settings_path: Option<PathBuf>,
     taskbar_created: u32,
 }
 
-impl TrayContext {
+impl AppContext {
     fn add_icon(&self) -> bool {
         let mut data = self.icon_data(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP);
         data.uCallbackMessage = WM_TRAY;
@@ -258,6 +300,8 @@ impl TrayContext {
         append(menu, MF_STRING | MF_DISABLED, 0, &state.battery_text());
         append(menu, MF_STRING | MF_DISABLED, 0, &state.dpi_text());
         append(menu, MF_SEPARATOR, 0, "");
+        append(menu, MF_STRING, OPEN_ID as usize, "Open LogiPeek");
+        append(menu, MF_SEPARATOR, 0, "");
         for (offset, preset) in state.presets().into_iter().enumerate() {
             let mut flags = MF_STRING;
             if !preset.enabled {
@@ -304,11 +348,10 @@ impl TrayContext {
     }
 
     fn dispatch_command(&self, command: u32, state: &AppState) {
-        let Some(worker) = &self.worker else {
-            return;
-        };
-        if command == REFRESH_ID {
-            worker.send(Command::RefreshAll);
+        if command == OPEN_ID {
+            crate::window::show(self.main_hwnd.get());
+        } else if command == REFRESH_ID {
+            self.refresh();
         } else if command == EXIT_ID {
             unsafe {
                 // SAFETY: hwnd belongs to the UI thread; WM_CLOSE performs normal cleanup.
@@ -317,16 +360,68 @@ impl TrayContext {
         } else if (PRESET_FIRST..PRESET_FIRST + 4).contains(&command) {
             let preset = state.presets()[(command - PRESET_FIRST) as usize];
             if preset.enabled {
-                worker.send(Command::SetDpi(preset.dpi));
+                self.submit_dpi(preset.dpi);
             }
         }
     }
 
-    fn snapshot(&self) -> AppState {
+    pub(crate) fn snapshot(&self) -> AppState {
         self.state
             .lock()
             .map(|state| state.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn set_main_hwnd(&self, hwnd: HWND) {
+        self.main_hwnd.set(hwnd);
+    }
+
+    pub(crate) fn refresh(&self) {
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.send(Command::RefreshAll));
+        if !sent && let Ok(mut state) = self.state.lock() {
+            state.operation = OperationStatus::Failed("HID worker is busy; try again".into());
+        }
+        crate::window::state_changed(self.main_hwnd.get());
+    }
+
+    pub(crate) fn submit_dpi(&self, value: u16) {
+        if let Ok(mut state) = self.state.lock() {
+            state.operation = OperationStatus::Applying(value);
+        }
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.send(Command::SetDpi(value)));
+        if !sent && let Ok(mut state) = self.state.lock() {
+            state.operation = OperationStatus::Failed("HID worker is busy; try again".into());
+        }
+        crate::window::state_changed(self.main_hwnd.get());
+    }
+
+    pub(crate) fn save_settings(&self, settings: Settings) {
+        let result = self
+            .settings_path
+            .as_deref()
+            .ok_or_else(|| "LOCALAPPDATA is unavailable".to_string())
+            .and_then(|path| save_settings_atomic(&settings, path));
+        if let Ok(mut state) = self.state.lock() {
+            state.apply_settings(&settings);
+            state.settings_notice = Some(match result {
+                Ok(()) => "Settings saved".into(),
+                Err(error) => format!("Settings are active but were not saved: {error}"),
+            });
+        }
+        crate::window::state_changed(self.main_hwnd.get());
+    }
+
+    pub(crate) fn set_notice(&self, notice: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.settings_notice = Some(notice.into());
+        }
+        crate::window::state_changed(self.main_hwnd.get());
     }
 
     fn icon_data(&self, flags: u32) -> NOTIFYICONDATAW {
@@ -370,7 +465,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     let pointer = unsafe {
         // SAFETY: Reading GWLP_USERDATA does not dereference the stored value.
         GetWindowLongPtrW(hwnd, GWLP_USERDATA)
-    } as *mut TrayContext;
+    } as *mut AppContext;
     if !pointer.is_null() {
         let context = unsafe {
             // SAFETY: run() stores a stable Box pointer before processing application messages.
@@ -385,13 +480,16 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
         match message {
             WM_TRAY => {
                 let event = lparam as u32 & 0xffff;
-                if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP | WM_LBUTTONUP) {
+                if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP) {
                     context.show_menu();
+                } else if matches!(event, WM_LBUTTONDBLCLK | NIN_SELECT) {
+                    crate::window::show(context.main_hwnd.get());
                 }
                 return 0;
             }
             WM_STATE_UPDATED => {
                 context.update_tooltip();
+                crate::window::state_changed(context.main_hwnd.get());
                 return 0;
             }
             WM_COMMAND => {
@@ -403,8 +501,8 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             WM_CLOSE => {
                 context.remove_icon();
                 unsafe {
-                    // SAFETY: hwnd is the live hidden window being closed.
-                    DestroyWindow(hwnd);
+                    // SAFETY: run() joins the worker before it destroys the notification window.
+                    PostQuitMessage(0);
                 }
                 return 0;
             }
@@ -479,6 +577,34 @@ fn copy_wide<const N: usize>(value: &str, destination: &mut [u16; N]) {
         }
         destination[offset..offset + units.len()].copy_from_slice(units);
         offset += units.len();
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|directory| directory.join("LogiPeek").join("settings.ini"))
+}
+
+fn save_settings_atomic(settings: &Settings, path: &Path) -> Result<(), String> {
+    let temporary = settings
+        .write_temporary(path)
+        .map_err(|error| error.to_string())?;
+    let source: Vec<u16> = temporary.as_os_str().encode_wide().chain([0]).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let moved = unsafe {
+        // SAFETY: Both paths are NUL-terminated UTF-16 buffers and refer to files on the same volume.
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0;
+    if moved {
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(temporary);
+        Err("atomic settings replacement failed".into())
     }
 }
 
