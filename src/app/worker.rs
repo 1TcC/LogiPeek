@@ -1,4 +1,4 @@
-use super::state::{AppState, OperationStatus};
+use super::state::{AppState, OperationError, OperationStatus};
 use crate::hid::{
     device::{self, ScanOptions},
     features::dpi::SetDpiOutcome,
@@ -70,18 +70,14 @@ fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: i
                             }
                             SetDpiOutcome::AcknowledgedMismatch { actual }
                             | SetDpiOutcome::TimedOutDifferent { actual } => {
-                                OperationStatus::Failed(format!(
-                                    "DPI remains {actual}; requested value was not verified"
-                                ))
+                                OperationStatus::Failed(OperationError::Remains(actual))
                             }
                             SetDpiOutcome::AcknowledgedUnverified { .. }
                             | SetDpiOutcome::TimedOutUnverified { .. } => {
-                                OperationStatus::Failed("DPI change could not be verified".into())
+                                OperationStatus::Failed(OperationError::NotVerified)
                             }
                         },
-                        Err(_) => OperationStatus::Failed(
-                            "DPI change failed; refresh the device and try again".into(),
-                        ),
+                        Err(_) => OperationStatus::Failed(OperationError::Failed),
                     };
                 }
             }
@@ -118,7 +114,7 @@ fn refresh_battery(state: &Mutex<AppState>) {
         if let Ok(mut current) = state.lock() {
             let settings = current.settings();
             let operation = current.operation.clone();
-            let notice = current.settings_notice.clone();
+            let notice = current.settings_notice;
             let mut replacement = AppState::default();
             replacement.apply_settings(&settings);
             replacement.operation = operation;

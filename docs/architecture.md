@@ -12,9 +12,10 @@ settings.ini → Settings Store ───────────┘
 `main` starts tray plus settings-window mode only when no arguments are present; every existing CLI argument still performs one operation and exits. The core library forbids unsafe code. Raw Win32 calls are isolated in the binary-only `app::tray` and `app::window` modules, with documented unsafe blocks and no unsafe HID parsing.
 
 - `app::tray` owns the hidden top-level window, notification icon, popup menu, named single-instance mutex, and blocking Win32 message loop. A small original monochrome mouse icon is generated at startup, avoiding a binary asset. The process detaches its console only after tray initialization succeeds, so CLI output remains intact.
-- `app::window` owns one fixed-size, Per-Monitor-V2-aware Win32 settings window. It custom-draws cards, battery progress, slider, presets, appearance choices, and inline status only during `WM_PAINT`. Closing hides it; tray Open shows the same HWND.
-- `app::state` is the single hardware and UI truth consumed by tray and window. It stores device status, battery semantics, current/supported DPI, operation status, four presets, theme, and settings-save notice. Multiple usable targets disable all DPI controls.
-- `app::settings` is a tolerant std-only `key=value` parser and serializer. Missing files, malformed individual fields, and unknown keys fall back or are ignored without preventing startup.
+- `app::window` owns one fixed 400 x 580 logical-pixel, Per-Monitor-V2-aware Win32 settings window. It custom-draws the first-run language picker, cards, battery progress, slider, presets, appearance/language choices, and inline status only during `WM_PAINT`. Closing hides it; tray Open shows the same HWND.
+- `app::state` is the single hardware and UI truth consumed by tray and window. It stores device status, battery semantics, current/supported DPI, operation status, four presets, theme, optional language, and settings-save notice. Multiple usable targets disable all DPI controls.
+- `app::settings` is a tolerant std-only `key=value` parser and serializer. Missing or invalid language remains `None` to select the first-run view; other malformed individual fields fall back, and unknown keys are ignored without preventing startup.
+- `app::text` centralizes the small English and Simplified Chinese GUI/tray catalog without an i18n framework. CLI strings deliberately remain English.
 - `app::slider` provides pure list/range position conversion. Discrete lists map positions to indices; ranges use the existing nearest-supported rule, including higher-value tie breaking.
 - `app::worker` owns the only background thread and a bounded one-command queue. It serializes startup/manual scans, tray DPI writes, and the 60-second battery refresh. `recv_timeout` blocks between work items, and the UI thread blocks in `GetMessageW`; neither loop spins.
 
@@ -42,9 +43,9 @@ Slider capture starts on mouse down. Mouse movement updates only a `preview` val
 
 Four custom numeric edit slots accept ASCII digits, Backspace, Tab, and Enter/Save Settings. Values are positive `u16` preferences; unsupported values may be saved but their tray/window buttons are disabled for the current device. There is no continuous render timer or animation loop.
 
-## Settings storage
+## Language selection and settings storage
 
-The runtime path is `%LOCALAPPDATA%\LogiPeek\settings.ini`. Fields are `preset1` through `preset4` and `theme=system|light|dark`. Saving writes, flushes, and syncs `settings.tmp`, then uses `MoveFileExW` with replace-existing and write-through flags for same-volume atomic replacement. A read or write failure leaves the application usable; write failure is reported inline. No registry, database, serializer crate, or network access is involved.
+The runtime path is `%LOCALAPPDATA%\LogiPeek\settings.ini`. Fields are `preset1` through `preset4`, `theme=system|light|dark`, and `language=en|zh-CN`. `language=None` is the only onboarding state: the main window renders the language picker instead of normal settings. Choosing a language saves it immediately, switches the window and tray catalog, and then reveals the main UI. Saving writes, flushes, and syncs `settings.tmp`, then uses `MoveFileExW` with replace-existing and write-through flags for same-volume atomic replacement. A read or write failure leaves the application usable; write failure is reported inline. No registry, database, serializer crate, or network access is involved.
 
 ## Capability-first discovery
 

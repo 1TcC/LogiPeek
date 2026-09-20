@@ -30,9 +30,10 @@ LogiPeek 通过 HID++ 能力探测机制，目标是尽可能兼容不同型号�
 - 提供一次性运行的 `--devices`、`--diag`、`--battery`、`--dpi` 和 `--set-dpi <DPI>` 命令。
 - 无参数运行时启动原生 Win32 托盘。菜单显示当前电池/DPI、Refresh、Exit，以及固定的 400/800/1600/3200 DPI 选项；设备不支持的选项保持可见但禁用，当前 DPI 匹配时会显示勾选。
 - 使用一个阻塞等待的 HID worker，每 60 秒刷新电池；DPI 只在启动、托盘写入后和手动 Refresh 时读取。命名互斥量阻止重复托盘实例，但不限制 CLI 命令。
-- 提供固定尺寸、支持 Per-Monitor DPI 的原生 Win32 设置窗口，显示电池状态、可用时的百分比进度条、当前 DPI、能力驱动滑块、四个 preset、内联操作状态和 Refresh。
+- 提供 400 x 580 逻辑像素的紧凑原生 Win32 设置窗口，支持 Per-Monitor DPI，显示电池状态、可用时的百分比进度条、当前 DPI、能力驱动滑块、四个 preset、内联操作状态和 Refresh。
 - 同时支持离散 DPI 列表和步进范围。拖动只更新 pending preview；释放时通过同一安全 setter 最多提交一次写入，失败后回到硬件实际值。
-- 支持编辑四个 preset slot，并选择 System、Light 或 Dark；当前设备不支持的 preset 仍可保存，但按钮会禁用。
+- 支持编辑四个 preset slot、选择 System、Light 或 Dark，并在英文与简体中文之间实时切换窗口和托盘；当前设备不支持的 preset 仍可保存，但按钮会禁用。
+- 首次运行或从缺少有效 `language` 字段的旧配置升级时，先显示窗口内语言选择页；选择保存后才进入正常设置页。
 - 使用同步临时文件和同卷原子替换，将容错、可读设置保存在 `%LOCALAPPDATA%\LogiPeek\settings.ini`；不使用注册表或数据库。
 - 关闭设置窗口会隐藏到托盘；`Open LogiPeek` 或托盘激活会重新显示同一窗口；Tray Exit 执行干净关闭。
 
@@ -72,7 +73,7 @@ cargo run -- --set-dpi 1600
 
 无参数执行 `cargo run` 可启动托盘与设置窗口。
 
-四个 preset 与外观选择会保存在本机。DPI 修改仍只是设备运行时值，不会写入板载配置。
+四个 preset、外观选择与 GUI 语言会保存在本机。DPI 修改仍只是设备运行时值，不会写入板载配置；CLI 输出保持英文。
 
 项目通过 `hidapi` 的 `windows-native` backend 访问 HID；运行时不需要网络。
 

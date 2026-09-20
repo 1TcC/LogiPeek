@@ -30,9 +30,10 @@ Designed to support as many Logitech mice as practical through HID++ capability 
 - Provides `--devices`, `--diag`, `--battery`, `--dpi`, and `--set-dpi <DPI>` as one-shot commands.
 - Starts a native Win32 tray when run without arguments. Its menu shows current battery/DPI state, Refresh, Exit, and fixed 400/800/1600/3200 DPI choices. Unsupported choices stay visible but disabled, and the current choice is checked when it matches.
 - Refreshes battery state every 60 seconds on one blocking HID worker. DPI is read at startup, after a tray write, and on manual Refresh. A named mutex prevents duplicate tray instances without blocking CLI commands.
-- Shows a fixed-size, Per-Monitor-DPI-aware native Win32 settings window with battery state, a progress bar when exact percentage exists, current DPI, a capability-driven slider, four presets, inline operation status, and Refresh.
+- Shows a compact 400 x 580 logical-pixel, Per-Monitor-DPI-aware native Win32 settings window with battery state, a progress bar when exact percentage exists, current DPI, a capability-driven slider, four presets, inline operation status, and Refresh.
 - Supports both discrete DPI lists and stepped ranges. Dragging updates only a pending preview; releasing commits at most one write through the same safe setter and returns to the hardware value after failure.
-- Lets users edit four preset slots and choose System, Light, or Dark appearance. Presets unsupported by the current device remain saved but disabled.
+- Lets users edit four preset slots, choose System, Light, or Dark appearance, and switch the window and tray live between English and Simplified Chinese. Presets unsupported by the current device remain saved but disabled.
+- Shows an in-window language picker on first run and after upgrade from settings without a valid `language` field; the normal settings page appears after the choice is saved.
 - Stores tolerant, human-readable settings in `%LOCALAPPDATA%\LogiPeek\settings.ini` using a synced temporary file and atomic same-volume replacement. No registry or database is used.
 - Closing the settings window hides it to the tray. `Open LogiPeek` or tray activation shows the same window again; Tray Exit performs clean shutdown.
 
@@ -72,7 +73,7 @@ cargo run -- --set-dpi 1600
 
 Run `cargo run` with no arguments to start the tray and settings window.
 
-The four presets and appearance choice are saved locally. DPI changes remain runtime-only device values and are not written to onboard profiles.
+The four presets, appearance choice, and GUI language are saved locally. DPI changes remain runtime-only device values and are not written to onboard profiles. CLI output remains English.
 
 The project uses `hidapi` with its `windows-native` backend. No runtime network access is required.
 

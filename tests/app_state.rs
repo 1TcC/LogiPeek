@@ -1,6 +1,6 @@
 use logipeek::app::{
     settings::{Settings, Theme},
-    state::{AppState, DEFAULT_PRESETS, DeviceStatus, OperationStatus},
+    state::{AppState, DEFAULT_PRESETS, DeviceStatus, OperationError, OperationStatus},
 };
 use logipeek::hid::{
     device::{Endpoint, FeatureResult, Interface},
@@ -166,6 +166,7 @@ fn custom_presets_share_state_and_unsupported_values_are_disabled() {
     state.apply_settings(&Settings {
         presets: [450, 850, 1700, 3200],
         theme: Theme::Dark,
+        language: None,
     });
     let presets = state.presets();
     assert_eq!(state.theme, Theme::Dark);
@@ -184,6 +185,9 @@ fn operation_status_never_changes_current_dpi_preview_truth() {
     assert_eq!(state.operation_text(), "Applying 1350 DPI...");
     state.operation = OperationStatus::Verified(1350);
     assert_eq!(state.operation_text(), "Verified 1350 DPI");
-    state.operation = OperationStatus::Failed("DPI change failed".into());
-    assert_eq!(state.operation_text(), "DPI change failed");
+    state.operation = OperationStatus::Failed(OperationError::Failed);
+    assert_eq!(
+        state.operation_text(),
+        "DPI change failed; refresh the device and try again"
+    );
 }

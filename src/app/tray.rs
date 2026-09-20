@@ -1,6 +1,7 @@
 use logipeek::app::{
-    settings::Settings,
-    state::{AppState, OperationStatus},
+    settings::{Language, Settings},
+    state::{AppState, OperationError, OperationStatus, SettingsNotice},
+    text::{TextKey, text},
     worker::{Command, Worker},
 };
 use std::{
@@ -304,12 +305,18 @@ impl AppContext {
             return;
         }
         let state = self.snapshot();
+        let language = state.ui_language();
         append(menu, MF_STRING | MF_DISABLED, 0, "LogiPeek");
         append(menu, MF_SEPARATOR, 0, "");
         append(menu, MF_STRING | MF_DISABLED, 0, &state.battery_text());
         append(menu, MF_STRING | MF_DISABLED, 0, &state.dpi_text());
         append(menu, MF_SEPARATOR, 0, "");
-        append(menu, MF_STRING, OPEN_ID as usize, "Open LogiPeek");
+        append(
+            menu,
+            MF_STRING,
+            OPEN_ID as usize,
+            text(language, TextKey::OpenLogiPeek),
+        );
         append(menu, MF_SEPARATOR, 0, "");
         for (offset, preset) in state.presets().into_iter().enumerate() {
             let mut flags = MF_STRING;
@@ -327,9 +334,19 @@ impl AppContext {
             );
         }
         append(menu, MF_SEPARATOR, 0, "");
-        append(menu, MF_STRING, REFRESH_ID as usize, "Refresh");
+        append(
+            menu,
+            MF_STRING,
+            REFRESH_ID as usize,
+            text(language, TextKey::Refresh),
+        );
         append(menu, MF_SEPARATOR, 0, "");
-        append(menu, MF_STRING, EXIT_ID as usize, "Exit");
+        append(
+            menu,
+            MF_STRING,
+            EXIT_ID as usize,
+            text(language, TextKey::Exit),
+        );
 
         let mut point = POINT::default();
         let command = unsafe {
@@ -391,7 +408,7 @@ impl AppContext {
             .as_ref()
             .is_some_and(|worker| worker.send(Command::RefreshAll));
         if !sent && let Ok(mut state) = self.state.lock() {
-            state.operation = OperationStatus::Failed("HID worker is busy; try again".into());
+            state.operation = OperationStatus::Failed(OperationError::WorkerBusy);
         }
         crate::window::state_changed(self.main_hwnd.get());
     }
@@ -405,7 +422,7 @@ impl AppContext {
             .as_ref()
             .is_some_and(|worker| worker.send(Command::SetDpi(value)));
         if !sent && let Ok(mut state) = self.state.lock() {
-            state.operation = OperationStatus::Failed("HID worker is busy; try again".into());
+            state.operation = OperationStatus::Failed(OperationError::WorkerBusy);
         }
         crate::window::state_changed(self.main_hwnd.get());
     }
@@ -417,18 +434,29 @@ impl AppContext {
             .ok_or_else(|| "LOCALAPPDATA is unavailable".to_string())
             .and_then(|path| save_settings_atomic(&settings, path));
         if let Ok(mut state) = self.state.lock() {
-            state.apply_settings(&settings);
-            state.settings_notice = Some(match result {
-                Ok(()) => "Settings saved".into(),
-                Err(_) => "Settings could not be saved".into(),
-            });
+            if result.is_ok() {
+                state.apply_settings(&settings);
+                state.settings_notice = Some(SettingsNotice::Saved);
+            } else {
+                state.settings_notice = Some(SettingsNotice::SaveFailed);
+            }
+        }
+        unsafe {
+            // SAFETY: The message carries no pointers and the tray window owns this context.
+            PostMessageW(self.hwnd, WM_STATE_UPDATED, 0, 0);
         }
         crate::window::state_changed(self.main_hwnd.get());
     }
 
-    pub(crate) fn set_notice(&self, notice: &str) {
+    pub(crate) fn set_language(&self, language: Language) {
+        let mut settings = self.snapshot().settings();
+        settings.language = Some(language);
+        self.save_settings(settings);
+    }
+
+    pub(crate) fn set_notice(&self, notice: SettingsNotice) {
         if let Ok(mut state) = self.state.lock() {
-            state.settings_notice = Some(notice.into());
+            state.settings_notice = Some(notice);
         }
         crate::window::state_changed(self.main_hwnd.get());
     }

@@ -1,8 +1,9 @@
 use crate::tray::AppContext;
 use logipeek::app::{
-    settings::{Settings, Theme},
+    settings::{Language, Settings, Theme},
     slider,
-    state::{DeviceStatus, OperationStatus},
+    state::{DeviceStatus, OperationStatus, SettingsNotice},
+    text::{TextKey, text},
 };
 use logipeek::hid::features::battery::Level;
 use std::{
@@ -43,12 +44,12 @@ use windows_sys::Win32::{
 };
 
 const CLASS_NAME: &str = "LogiPeek.Settings.Window";
-const CLIENT_WIDTH: i32 = 440;
-const CLIENT_HEIGHT: i32 = 660;
+const CLIENT_WIDTH: i32 = 400;
+const CLIENT_HEIGHT: i32 = 580;
 const WM_REDRAW: u32 = WM_APP + 10;
-const REFRESH_RECT: (i32, i32, i32, i32) = (380, 22, 36, 36);
-const SLIDER_RECT: (i32, i32, i32, i32) = (38, 330, 364, 40);
-const SAVE_RECT: (i32, i32, i32, i32) = (300, 603, 104, 30);
+const REFRESH_RECT: (i32, i32, i32, i32) = (344, 18, 36, 36);
+const SLIDER_RECT: (i32, i32, i32, i32) = (28, 276, 344, 42);
+const SAVE_RECT: (i32, i32, i32, i32) = (286, 388, 78, 28);
 
 pub(crate) struct MainWindow {
     hwnd: HWND,
@@ -77,6 +78,7 @@ enum HitTarget {
     Preset(usize),
     Edit(usize),
     Theme(usize),
+    Language(usize),
     Save,
 }
 
@@ -426,11 +428,12 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             return 0;
         }
         WM_KEYDOWN => {
-            if wparam as u16 == VK_F5 {
+            let language_selected = app(state).snapshot().language.is_some();
+            if wparam as u16 == VK_F5 && language_selected {
                 app(state).refresh();
-            } else if wparam as u16 == VK_RETURN {
+            } else if wparam as u16 == VK_RETURN && language_selected {
                 save_from_controls(state);
-            } else if wparam as u16 == VK_TAB {
+            } else if wparam as u16 == VK_TAB && language_selected {
                 let next = state.editing.get().map_or(0, |index| (index + 1) % 4);
                 state.editing.set(Some(next));
                 invalidate(hwnd);
@@ -519,6 +522,10 @@ fn handle_target(state: &WindowState, target: HitTarget) {
             apply_theme(state);
             invalidate(state.hwnd.get());
         }
+        HitTarget::Language(index) => {
+            let language = [Language::English, Language::SimplifiedChinese][index];
+            app(state).set_language(language);
+        }
         HitTarget::Save => save_from_controls(state),
         HitTarget::Slider => {}
     }
@@ -527,6 +534,14 @@ fn handle_target(state: &WindowState, target: HitTarget) {
 fn hit_target(state: &WindowState, x: i32, y: i32) -> Option<HitTarget> {
     let dpi = state.dpi.get();
     let logical = (unscale(x, dpi), unscale(y, dpi));
+    if app(state).snapshot().language.is_none() {
+        for index in 0..2 {
+            if contains(picker_language_rect(index), logical) {
+                return Some(HitTarget::Language(index));
+            }
+        }
+        return None;
+    }
     if contains(REFRESH_RECT, logical) {
         return Some(HitTarget::Refresh);
     }
@@ -544,6 +559,11 @@ fn hit_target(state: &WindowState, x: i32, y: i32) -> Option<HitTarget> {
     for index in 0..3 {
         if contains(theme_rect(index), logical) {
             return Some(HitTarget::Theme(index));
+        }
+    }
+    for index in 0..2 {
+        if contains(language_rect(index), logical) {
+            return Some(HitTarget::Language(index));
         }
     }
     contains(SAVE_RECT, logical).then_some(HitTarget::Save)
@@ -585,8 +605,8 @@ fn preview_slider(state: &WindowState, x: i32) {
         return;
     };
     let dpi = state.dpi.get();
-    let left = scale(48, dpi);
-    let width = scale(344, dpi).max(1);
+    let left = scale(38, dpi);
+    let width = scale(324, dpi).max(1);
     state.preview.set(slider::value_at(values, x - left, width));
     invalidate(state.hwnd.get());
 }
@@ -602,18 +622,19 @@ fn commit_slider(state: &WindowState, value: u16) {
 }
 
 fn save_from_controls(state: &WindowState) {
+    let snapshot = app(state).snapshot();
     let mut presets = [0u16; 4];
     let Ok(drafts) = state.drafts.lock() else {
-        app(state).set_notice("Preset editor is unavailable");
+        app(state).set_notice(SettingsNotice::InvalidPreset);
         return;
     };
     for (index, draft) in drafts.iter().enumerate() {
         let Some(value) = draft.trim().parse::<u16>().ok() else {
-            app(state).set_notice("Presets must be 1-65535");
+            app(state).set_notice(SettingsNotice::InvalidPreset);
             return;
         };
         if value == 0 {
-            app(state).set_notice("Presets must be 1-65535");
+            app(state).set_notice(SettingsNotice::InvalidPreset);
             return;
         }
         presets[index] = value;
@@ -622,6 +643,7 @@ fn save_from_controls(state: &WindowState) {
     app(state).save_settings(Settings {
         presets,
         theme: state.pending_theme.get(),
+        language: snapshot.language,
     });
 }
 
@@ -668,18 +690,28 @@ fn paint(state: &WindowState) {
     }
     fill(dc, client, palette.background);
 
-    let title = font(dpi, 24, 600);
-    let heading = font(dpi, 13, 600);
-    let body = font(dpi, 13, 400);
-    let secondary = font(dpi, 11, 400);
-    let dpi_font = font(dpi, 39, 600);
-    let battery_font = font(dpi, 22, 600);
+    if snapshot.language.is_none() {
+        paint_language_picker(state, dc, palette, dpi);
+        unsafe {
+            // SAFETY: Completes the BeginPaint call above.
+            EndPaint(hwnd, &paint);
+        }
+        return;
+    }
+
+    let language = snapshot.ui_language();
+    let title = font(dpi, 22, 600);
+    let heading = font(dpi, 12, 600);
+    let body = font(dpi, 12, 400);
+    let secondary = font(dpi, 10, 400);
+    let dpi_font = font(dpi, 36, 600);
+    let battery_font = font(dpi, 20, 600);
     draw_text(
         dc,
         title,
         palette.text,
-        scale(24, dpi),
-        scale(18, dpi),
+        scale(20, dpi),
+        scale(14, dpi),
         "LogiPeek",
     );
     draw_button(
@@ -701,8 +733,8 @@ fn paint(state: &WindowState) {
         dc,
         body,
         palette.text,
-        scale(24, dpi),
-        scale(56, dpi),
+        scale(20, dpi),
+        scale(48, dpi),
         "Logitech Mouse",
     );
     let status_color = match snapshot.status {
@@ -712,34 +744,34 @@ fn paint(state: &WindowState) {
     circle(
         dc,
         status_color,
-        scale(29, dpi),
-        scale(85, dpi),
+        scale(25, dpi),
+        scale(74, dpi),
         scale(3, dpi).max(2),
     );
     draw_text(
         dc,
         secondary,
         palette.secondary,
-        scale(39, dpi),
-        scale(78, dpi),
+        scale(34, dpi),
+        scale(67, dpi),
         snapshot.connection_text(),
     );
 
-    draw_card(dc, palette, dpi, (24, 108, 392, 108));
+    draw_card(dc, palette, dpi, (20, 92, 360, 84));
     draw_text(
         dc,
         heading,
         palette.text,
-        scale(42, dpi),
-        scale(126, dpi),
-        "Battery",
+        scale(36, dpi),
+        scale(106, dpi),
+        text(language, TextKey::Battery),
     );
     let battery = snapshot.battery_value_text();
     draw_text_center(
         dc,
         battery_font,
         palette.text,
-        dpi_rect((326, 117, 72, 36), dpi),
+        dpi_rect((292, 100, 72, 32), dpi),
         &battery,
     );
     if let Some(percent) = snapshot.battery_percent {
@@ -750,19 +782,19 @@ fn paint(state: &WindowState) {
         dc,
         secondary,
         palette.secondary,
-        scale(42, dpi),
-        scale(186, dpi),
+        scale(36, dpi),
+        scale(153, dpi),
         &battery_detail,
     );
 
-    draw_card(dc, palette, dpi, (24, 232, 392, 220));
+    draw_card(dc, palette, dpi, (20, 188, 360, 180));
     draw_text(
         dc,
         heading,
         palette.secondary,
-        scale(42, dpi),
-        scale(250, dpi),
-        "POINTER SPEED",
+        scale(36, dpi),
+        scale(201, dpi),
+        text(language, TextKey::PointerSpeed),
     );
     let displayed =
         if state.dragging.get() || matches!(snapshot.operation, OperationStatus::Applying(_)) {
@@ -774,14 +806,14 @@ fn paint(state: &WindowState) {
         dc,
         dpi_font,
         palette.text,
-        dpi_rect((92, 262, 256, 54), dpi),
+        dpi_rect((80, 211, 240, 52), dpi),
         &displayed.map_or_else(|| "—".into(), |value| value.to_string()),
     );
     draw_text_center(
         dc,
         secondary,
         palette.secondary,
-        dpi_rect((160, 310, 120, 20), dpi),
+        dpi_rect((140, 255, 120, 18), dpi),
         "DPI",
     );
     draw_slider(dc, &snapshot, palette, dpi, displayed);
@@ -809,20 +841,20 @@ fn paint(state: &WindowState) {
             dc,
             secondary,
             palette.secondary,
-            scale(42, dpi),
-            scale(378, dpi),
+            scale(36, dpi),
+            scale(312, dpi),
             &operation,
         );
     }
 
-    draw_card(dc, palette, dpi, (24, 468, 392, 172));
+    draw_card(dc, palette, dpi, (20, 380, 360, 178));
     draw_text(
         dc,
         heading,
         palette.text,
-        scale(42, dpi),
-        scale(482, dpi),
-        "Presets",
+        scale(36, dpi),
+        scale(390, dpi),
+        text(language, TextKey::Presets),
     );
     let drafts = state
         .drafts
@@ -853,14 +885,14 @@ fn paint(state: &WindowState) {
         dc,
         heading,
         palette.text,
-        scale(42, dpi),
-        scale(548, dpi),
-        "Appearance",
+        scale(36, dpi),
+        scale(449, dpi),
+        text(language, TextKey::Appearance),
     );
-    for (index, (theme, label)) in [
-        (Theme::System, "System"),
-        (Theme::Light, "Light"),
-        (Theme::Dark, "Dark"),
+    for (index, (theme, key)) in [
+        (Theme::System, TextKey::System),
+        (Theme::Light, TextKey::Light),
+        (Theme::Dark, TextKey::Dark),
     ]
     .into_iter()
     .enumerate()
@@ -873,9 +905,40 @@ fn paint(state: &WindowState) {
             dpi,
             Button {
                 rect: theme_rect(index),
-                label,
+                label: text(language, key),
                 enabled: true,
                 selected: state.pending_theme.get() == theme,
+                hovered: state.hover.get() == Some(target),
+                pressed: state.pressed.get() == Some(target),
+            },
+        );
+    }
+    draw_text(
+        dc,
+        heading,
+        palette.text,
+        scale(36, dpi),
+        scale(503, dpi),
+        text(language, TextKey::LanguageLabel),
+    );
+    for (index, (choice, key)) in [
+        (Language::English, TextKey::EnglishLabel),
+        (Language::SimplifiedChinese, TextKey::SimplifiedChineseLabel),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = HitTarget::Language(index);
+        draw_button(
+            dc,
+            body,
+            palette,
+            dpi,
+            Button {
+                rect: language_rect(index),
+                label: text(language, key),
+                enabled: true,
+                selected: snapshot.language == Some(choice),
                 hovered: state.hover.get() == Some(target),
                 pressed: state.pressed.get() == Some(target),
             },
@@ -888,31 +951,23 @@ fn paint(state: &WindowState) {
         dpi,
         Button {
             rect: SAVE_RECT,
-            label: "Save",
+            label: text(language, TextKey::Save),
             enabled: true,
             selected: true,
             hovered: state.hover.get() == Some(HitTarget::Save),
             pressed: state.pressed.get() == Some(HitTarget::Save),
         },
     );
-    if let Some(notice) = snapshot.settings_notice.as_deref() {
+    if let Some(notice) = snapshot.settings_notice_text() {
         draw_text(
             dc,
             secondary,
             palette.secondary,
-            scale(42, dpi),
-            scale(611, dpi),
+            scale(22, dpi),
+            scale(562, dpi),
             notice,
         );
     }
-    draw_text(
-        dc,
-        secondary,
-        palette.secondary,
-        scale(24, dpi),
-        scale(635, dpi),
-        "Closing this window keeps LogiPeek running in the tray.",
-    );
 
     for object in [title, heading, body, secondary, dpi_font, battery_font] {
         if !object.is_null() {
@@ -928,6 +983,74 @@ fn paint(state: &WindowState) {
     }
 }
 
+fn paint_language_picker(state: &WindowState, dc: HDC, palette: Palette, dpi: u32) {
+    let title = font(dpi, 23, 600);
+    let heading = font(dpi, 14, 600);
+    let body = font(dpi, 13, 400);
+    draw_card(dc, palette, dpi, (36, 112, 328, 330));
+    draw_text_center(
+        dc,
+        title,
+        palette.text,
+        dpi_rect((52, 152, 296, 42), dpi),
+        text(Language::English, TextKey::Welcome),
+    );
+    draw_text_center(
+        dc,
+        heading,
+        palette.secondary,
+        dpi_rect((52, 218, 296, 28), dpi),
+        text(Language::English, TextKey::ChooseLanguage),
+    );
+    draw_text_center(
+        dc,
+        heading,
+        palette.secondary,
+        dpi_rect((52, 245, 296, 28), dpi),
+        text(Language::SimplifiedChinese, TextKey::ChooseLanguage),
+    );
+    for (index, (language, key)) in [
+        (Language::English, TextKey::EnglishLabel),
+        (Language::SimplifiedChinese, TextKey::SimplifiedChineseLabel),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = HitTarget::Language(index);
+        draw_button(
+            dc,
+            body,
+            palette,
+            dpi,
+            Button {
+                rect: picker_language_rect(index),
+                label: text(language, key),
+                enabled: true,
+                selected: false,
+                hovered: state.hover.get() == Some(target),
+                pressed: state.pressed.get() == Some(target),
+            },
+        );
+    }
+    if let Some(notice) = app(state).snapshot().settings_notice_text() {
+        draw_text_center(
+            dc,
+            body,
+            palette.secondary,
+            dpi_rect((52, 405, 296, 24), dpi),
+            notice,
+        );
+    }
+    for object in [title, heading, body] {
+        if !object.is_null() {
+            unsafe {
+                // SAFETY: Each font was created for this paint and is no longer selected.
+                DeleteObject(object);
+            }
+        }
+    }
+}
+
 fn draw_slider(
     dc: HDC,
     snapshot: &logipeek::app::state::AppState,
@@ -935,9 +1058,9 @@ fn draw_slider(
     dpi: u32,
     displayed: Option<u16>,
 ) {
-    let left = scale(48, dpi);
-    let right = scale(392, dpi);
-    let y = scale(350, dpi);
+    let left = scale(38, dpi);
+    let right = scale(362, dpi);
+    let y = scale(288, dpi);
     line(dc, palette.track, scale(3, dpi).max(1), left, y, right, y);
     if let Some(values) = snapshot.supported_dpi.as_ref() {
         if let Some(value) = displayed
@@ -962,15 +1085,15 @@ fn draw_slider(
                 small,
                 palette.secondary,
                 left,
-                scale(365, dpi),
+                scale(299, dpi),
                 &minimum.to_string(),
             );
             draw_text(
                 dc,
                 small,
                 palette.secondary,
-                scale(350, dpi),
-                scale(365, dpi),
+                scale(320, dpi),
+                scale(299, dpi),
                 &maximum.to_string(),
             );
             if !small.is_null() {
@@ -987,8 +1110,8 @@ fn draw_slider(
             small,
             palette.secondary,
             left,
-            scale(365, dpi),
-            "DPI controls unavailable",
+            scale(299, dpi),
+            text(snapshot.ui_language(), TextKey::DpiControlsUnavailable),
         );
         if !small.is_null() {
             unsafe {
@@ -1001,10 +1124,10 @@ fn draw_slider(
 
 fn draw_progress(dc: HDC, palette: Palette, dpi: u32, percent: u8) {
     let track = RECT {
-        left: scale(42, dpi),
-        top: scale(166, dpi),
-        right: scale(398, dpi),
-        bottom: scale(174, dpi),
+        left: scale(36, dpi),
+        top: scale(137, dpi),
+        right: scale(364, dpi),
+        bottom: scale(145, dpi),
     };
     rounded_fill(dc, track, palette.track, scale(8, dpi));
     let filled = RECT {
@@ -1307,15 +1430,23 @@ fn slider_hit(state: &WindowState, x: i32, y: i32) -> bool {
 }
 
 fn preset_rect(index: usize) -> (i32, i32, i32, i32) {
-    (36 + index as i32 * 96, 402, 80, 34)
+    (30 + index as i32 * 86, 328, 76, 30)
 }
 
 fn edit_rect(index: usize) -> (i32, i32, i32, i32) {
-    (36 + index as i32 * 96, 507, 80, 30)
+    (30 + index as i32 * 86, 416, 76, 28)
 }
 
 fn theme_rect(index: usize) -> (i32, i32, i32, i32) {
-    (36 + index as i32 * 84, 569, 84, 32)
+    (112 + index as i32 * 84, 444, 82, 28)
+}
+
+fn language_rect(index: usize) -> (i32, i32, i32, i32) {
+    (112 + index as i32 * 122, 498, 120, 28)
+}
+
+fn picker_language_rect(index: usize) -> (i32, i32, i32, i32) {
+    (78, 300 + index as i32 * 54, 244, 38)
 }
 
 fn dpi_rect(rect: (i32, i32, i32, i32), dpi: u32) -> RECT {
@@ -1328,19 +1459,22 @@ fn dpi_rect(rect: (i32, i32, i32, i32), dpi: u32) -> RECT {
 }
 
 fn battery_detail(state: &logipeek::app::state::AppState) -> String {
+    let language = state.ui_language();
     let level = match state.battery_level.as_ref() {
-        Some(Level::Critical) => Some("Critical"),
-        Some(Level::Low) => Some("Low"),
-        Some(Level::Good) => Some("Good"),
-        Some(Level::Full) => Some("Full"),
-        Some(Level::Unknown(_)) => Some("Unknown"),
+        Some(Level::Critical) => Some(text(language, TextKey::Critical)),
+        Some(Level::Low) => Some(text(language, TextKey::Low)),
+        Some(Level::Good) => Some(text(language, TextKey::Good)),
+        Some(Level::Full) => Some(text(language, TextKey::Full)),
+        Some(Level::Unknown(_)) => Some(text(language, TextKey::Unknown)),
         None => None,
     };
     let charging = state.charging_text();
-    match (level, charging) {
-        (Some(level), "Status unavailable") => level.into(),
-        (Some(level), charging) => format!("{level} · {charging}"),
-        (None, charging) => charging.into(),
+    if charging == text(language, TextKey::StatusUnavailable) {
+        level.unwrap_or(charging).into()
+    } else if let Some(level) = level {
+        format!("{level} · {charging}")
+    } else {
+        charging.into()
     }
 }
 
@@ -1382,4 +1516,36 @@ fn rgb(red: u32, green: u32, blue: u32) -> u32 {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain([0]).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_controls_fit_at_supported_test_dpis() {
+        let mut rects = vec![REFRESH_RECT, SLIDER_RECT, SAVE_RECT];
+        rects.extend((0..4).flat_map(|index| [preset_rect(index), edit_rect(index)]));
+        rects.extend((0..3).map(theme_rect));
+        rects.extend((0..2).flat_map(|index| [language_rect(index), picker_language_rect(index)]));
+
+        for dpi in [96, 120, 192] {
+            for rect in &rects {
+                let physical = dpi_rect(*rect, dpi);
+                assert!(physical.left >= 0 && physical.top >= 0);
+                assert!(physical.right <= scale(CLIENT_WIDTH, dpi));
+                assert!(physical.bottom <= scale(CLIENT_HEIGHT, dpi));
+            }
+        }
+    }
+
+    #[test]
+    fn compact_sections_do_not_overlap() {
+        let battery = (20, 92, 360, 84);
+        let dpi = (20, 188, 360, 180);
+        let settings = (20, 380, 360, 178);
+        assert!(battery.1 + battery.3 < dpi.1);
+        assert!(dpi.1 + dpi.3 < settings.1);
+        assert!(settings.1 + settings.3 <= CLIENT_HEIGHT);
+    }
 }

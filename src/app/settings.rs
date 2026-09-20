@@ -14,10 +14,17 @@ pub enum Theme {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    English,
+    SimplifiedChinese,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub presets: [u16; 4],
     pub theme: Theme,
+    pub language: Option<Language>,
 }
 
 impl Default for Settings {
@@ -25,6 +32,7 @@ impl Default for Settings {
         Self {
             presets: DEFAULT_PRESETS,
             theme: Theme::System,
+            language: None,
         }
     }
 }
@@ -51,6 +59,13 @@ impl Settings {
                         _ => defaults.theme,
                     };
                 }
+                "language" => {
+                    settings.language = match value {
+                        "en" => Some(Language::English),
+                        "zh-CN" => Some(Language::SimplifiedChinese),
+                        _ => None,
+                    };
+                }
                 _ => {}
             }
         }
@@ -63,8 +78,13 @@ impl Settings {
             Theme::Light => "light",
             Theme::Dark => "dark",
         };
+        let language = match self.language {
+            Some(Language::English) => "language=en\n",
+            Some(Language::SimplifiedChinese) => "language=zh-CN\n",
+            None => "",
+        };
         format!(
-            "preset1={}\npreset2={}\npreset3={}\npreset4={}\ntheme={theme}\n",
+            "preset1={}\npreset2={}\npreset3={}\npreset4={}\ntheme={theme}\n{language}",
             self.presets[0], self.presets[1], self.presets[2], self.presets[3]
         )
     }

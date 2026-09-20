@@ -1,5 +1,8 @@
 pub use super::settings::DEFAULT_PRESETS;
-use super::settings::{Settings, Theme};
+use super::{
+    settings::{Language, Settings, Theme},
+    text::{TextKey, text},
+};
 use crate::hid::{
     device::{Endpoint, Interface},
     features::{
@@ -14,7 +17,22 @@ pub enum OperationStatus {
     Idle,
     Applying(u16),
     Verified(u16),
-    Failed(String),
+    Failed(OperationError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationError {
+    WorkerBusy,
+    Remains(u16),
+    NotVerified,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsNotice {
+    Saved,
+    SaveFailed,
+    InvalidPreset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +60,9 @@ pub struct AppState {
     pub supported_dpi: Option<DpiValues>,
     pub presets: [u16; 4],
     pub theme: Theme,
+    pub language: Option<Language>,
     pub operation: OperationStatus,
-    pub settings_notice: Option<String>,
+    pub settings_notice: Option<SettingsNotice>,
     target: Option<TargetKey>,
 }
 
@@ -67,6 +86,7 @@ impl Default for AppState {
             supported_dpi: None,
             presets: Settings::default().presets,
             theme: Theme::System,
+            language: None,
             operation: OperationStatus::Idle,
             settings_notice: None,
             target: None,
@@ -86,6 +106,7 @@ impl AppState {
                 status: DeviceStatus::MultipleDevices,
                 presets: settings.presets,
                 theme: settings.theme,
+                language: settings.language,
                 ..Self::default()
             };
         }
@@ -93,6 +114,7 @@ impl AppState {
             return Self {
                 presets: settings.presets,
                 theme: settings.theme,
+                language: settings.language,
                 ..Self::default()
             };
         };
@@ -115,6 +137,7 @@ impl AppState {
             supported_dpi: sensor.map(|value| value.supported),
             presets: settings.presets,
             theme: settings.theme,
+            language: settings.language,
             operation: OperationStatus::Idle,
             settings_notice: None,
             target: Some(TargetKey::new(interface, endpoint)),
@@ -124,7 +147,7 @@ impl AppState {
     pub fn replace_from_scan(&mut self, interfaces: &[Interface]) {
         let settings = self.settings();
         let operation = self.operation.clone();
-        let notice = self.settings_notice.clone();
+        let notice = self.settings_notice;
         *self = Self::from_scan_with_settings(interfaces, &settings);
         self.operation = operation;
         self.settings_notice = notice;
@@ -133,12 +156,14 @@ impl AppState {
     pub fn apply_settings(&mut self, settings: &Settings) {
         self.presets = settings.presets;
         self.theme = settings.theme;
+        self.language = settings.language;
     }
 
     pub fn settings(&self) -> Settings {
         Settings {
             presets: self.presets,
             theme: self.theme,
+            language: self.language,
         }
     }
 
@@ -147,13 +172,14 @@ impl AppState {
     pub fn apply_battery_scan(&mut self, interfaces: &[Interface]) {
         let settings = self.settings();
         let operation = self.operation.clone();
-        let notice = self.settings_notice.clone();
+        let notice = self.settings_notice;
         let targets = targets(interfaces);
         if targets.len() > 1 {
             *self = Self {
                 status: DeviceStatus::MultipleDevices,
                 presets: settings.presets,
                 theme: settings.theme,
+                language: settings.language,
                 operation,
                 settings_notice: notice,
                 ..Self::default()
@@ -164,6 +190,7 @@ impl AppState {
             *self = Self {
                 presets: settings.presets,
                 theme: settings.theme,
+                language: settings.language,
                 operation,
                 settings_notice: notice,
                 ..Self::default()
@@ -184,6 +211,7 @@ impl AppState {
                 charging: battery.map(|battery| battery.charging.clone()),
                 presets: settings.presets,
                 theme: settings.theme,
+                language: settings.language,
                 operation,
                 settings_notice: notice,
                 target: Some(key),
@@ -211,12 +239,25 @@ impl AppState {
     }
 
     pub fn battery_text(&self) -> String {
+        let language = self.ui_language();
         match self.status {
-            DeviceStatus::MultipleDevices => "Battery: Multiple devices".into(),
+            DeviceStatus::MultipleDevices => format!(
+                "{}: {}",
+                text(language, TextKey::Battery),
+                text(language, TextKey::MultipleDevices)
+            ),
             _ => match (self.battery_percent, &self.battery_level) {
-                (Some(value), _) => format!("Battery: {value}%"),
-                (None, Some(level)) => format!("Battery: {}", level_text(level)),
-                _ => "Battery: Unavailable".into(),
+                (Some(value), _) => format!("{}: {value}%", text(language, TextKey::Battery)),
+                (None, Some(level)) => format!(
+                    "{}: {}",
+                    text(language, TextKey::Battery),
+                    level_text(language, level)
+                ),
+                _ => format!(
+                    "{}: {}",
+                    text(language, TextKey::Battery),
+                    text(language, TextKey::Unavailable)
+                ),
             },
         }
     }
@@ -224,61 +265,107 @@ impl AppState {
     pub fn battery_value_text(&self) -> String {
         match (self.battery_percent, &self.battery_level) {
             (Some(value), _) => format!("{value}%"),
-            (None, Some(level)) => level_text(level).into(),
+            (None, Some(level)) => level_text(self.ui_language(), level).into(),
             _ => "—".into(),
         }
     }
 
     pub fn dpi_text(&self) -> String {
+        let language = self.ui_language();
         match self.status {
-            DeviceStatus::MultipleDevices => "DPI: Multiple devices".into(),
+            DeviceStatus::MultipleDevices => {
+                format!("DPI: {}", text(language, TextKey::MultipleDevices))
+            }
             _ => self.current_dpi.map_or_else(
-                || "DPI: Unavailable".into(),
+                || format!("DPI: {}", text(language, TextKey::Unavailable)),
                 |value| format!("DPI: {value}"),
             ),
         }
     }
 
     pub fn tooltip(&self) -> String {
+        let language = self.ui_language();
         match self.status {
-            DeviceStatus::MultipleDevices => "LogiPeek - Multiple devices".into(),
-            DeviceStatus::Unavailable => "LogiPeek - Device unavailable".into(),
+            DeviceStatus::MultipleDevices => {
+                format!("LogiPeek - {}", text(language, TextKey::MultipleDevices))
+            }
+            DeviceStatus::Unavailable => {
+                format!("LogiPeek - {}", text(language, TextKey::DeviceUnavailable))
+            }
             DeviceStatus::Single => match (self.battery_percent, self.current_dpi) {
                 (Some(battery), Some(dpi)) => format!("LogiPeek - {battery}% - {dpi} DPI"),
                 (Some(battery), None) => format!("LogiPeek - {battery}%"),
                 (None, Some(dpi)) => format!("LogiPeek - {dpi} DPI"),
-                (None, None) => "LogiPeek - Device unavailable".into(),
+                (None, None) => {
+                    format!("LogiPeek - {}", text(language, TextKey::DeviceUnavailable))
+                }
             },
         }
     }
 
     pub fn connection_text(&self) -> &'static str {
+        let language = self.ui_language();
         match self.status {
-            DeviceStatus::Unavailable => "Device unavailable",
-            DeviceStatus::Single => "Connected",
-            DeviceStatus::MultipleDevices => "Multiple Logitech devices detected",
+            DeviceStatus::Unavailable => text(language, TextKey::DeviceUnavailable),
+            DeviceStatus::Single => text(language, TextKey::Connected),
+            DeviceStatus::MultipleDevices => text(language, TextKey::MultipleDevicesDetected),
         }
     }
 
     pub fn charging_text(&self) -> &'static str {
+        let language = self.ui_language();
         match self.charging {
-            Some(Charging::Discharging) => "Discharging",
-            Some(Charging::Charging | Charging::FinalStage | Charging::Slow) => "Charging",
-            Some(Charging::Complete) => "Full",
-            Some(Charging::InvalidBattery | Charging::ThermalError | Charging::Error) => {
-                "Battery error"
+            Some(Charging::Discharging) => text(language, TextKey::Discharging),
+            Some(Charging::Charging | Charging::FinalStage | Charging::Slow) => {
+                text(language, TextKey::Charging)
             }
-            Some(Charging::Unknown(_)) | None => "Status unavailable",
+            Some(Charging::Complete) => text(language, TextKey::Full),
+            Some(Charging::InvalidBattery | Charging::ThermalError | Charging::Error) => {
+                text(language, TextKey::BatteryError)
+            }
+            Some(Charging::Unknown(_)) | None => text(language, TextKey::StatusUnavailable),
         }
     }
 
     pub fn operation_text(&self) -> String {
+        let language = self.ui_language();
         match &self.operation {
             OperationStatus::Idle => String::new(),
-            OperationStatus::Applying(value) => format!("Applying {value} DPI..."),
-            OperationStatus::Verified(value) => format!("Verified {value} DPI"),
-            OperationStatus::Failed(error) => error.clone(),
+            OperationStatus::Applying(value) => {
+                format!("{} {value} DPI...", text(language, TextKey::Applying))
+            }
+            OperationStatus::Verified(value) => {
+                format!("{} {value} DPI", text(language, TextKey::Verified))
+            }
+            OperationStatus::Failed(OperationError::WorkerBusy) => {
+                text(language, TextKey::WorkerBusy).into()
+            }
+            OperationStatus::Failed(OperationError::Remains(actual)) => match language {
+                Language::English => {
+                    format!("DPI remains {actual}; requested value was not verified")
+                }
+                Language::SimplifiedChinese => format!("DPI 仍为 {actual}；请求值未通过验证"),
+            },
+            OperationStatus::Failed(OperationError::NotVerified) => {
+                text(language, TextKey::DpiNotVerified).into()
+            }
+            OperationStatus::Failed(OperationError::Failed) => {
+                text(language, TextKey::DpiFailed).into()
+            }
         }
+    }
+
+    pub fn settings_notice_text(&self) -> Option<&'static str> {
+        let language = self.ui_language();
+        self.settings_notice.map(|notice| match notice {
+            SettingsNotice::Saved => text(language, TextKey::SettingsSaved),
+            SettingsNotice::SaveFailed => text(language, TextKey::SettingsSaveFailed),
+            SettingsNotice::InvalidPreset => text(language, TextKey::InvalidPreset),
+        })
+    }
+
+    pub fn ui_language(&self) -> Language {
+        self.language.unwrap_or(Language::English)
     }
 }
 
@@ -312,12 +399,12 @@ fn targets(interfaces: &[Interface]) -> Vec<(&Interface, &Endpoint)> {
         .collect()
 }
 
-fn level_text(level: &Level) -> &'static str {
+fn level_text(language: Language, level: &Level) -> &'static str {
     match level {
-        Level::Critical => "Critical",
-        Level::Low => "Low",
-        Level::Good => "Good",
-        Level::Full => "Full",
-        Level::Unknown(_) => "Unknown",
+        Level::Critical => text(language, TextKey::Critical),
+        Level::Low => text(language, TextKey::Low),
+        Level::Good => text(language, TextKey::Good),
+        Level::Full => text(language, TextKey::Full),
+        Level::Unknown(_) => text(language, TextKey::Unknown),
     }
 }
