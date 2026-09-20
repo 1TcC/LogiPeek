@@ -19,6 +19,10 @@ use windows_sys::Win32::{
         CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT,
         POINT, WPARAM,
     },
+    Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
+        DeleteObject,
+    },
     Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
     System::{Console::FreeConsole, LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
@@ -30,14 +34,14 @@ use windows_sys::Win32::{
             Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
-            AppendMenuW, CreateIcon, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-            DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW,
-            GetWindowLongPtrW, HICON, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-            MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-            SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-            TrackPopupMenu, TranslateMessage, UnregisterClassW, WM_APP, WM_CLOSE, WM_COMMAND,
-            WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP,
-            WNDCLASSW, WS_EX_TOOLWINDOW,
+            AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+            DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos,
+            GetMessageW, GetWindowLongPtrW, HICON, ICONINFO, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+            MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+            RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnregisterClassW,
+            WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK,
+            WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -114,8 +118,8 @@ pub fn run() -> Result<(), String> {
         return Err("Could not create the LogiPeek tray window".into());
     }
 
-    let icon = match create_icon(instance) {
-        Ok(icon) => icon,
+    let icons = match AppIcons::create(instance) {
+        Ok(icons) => icons,
         Err(error) => {
             unsafe {
                 // SAFETY: The window and class were created by this thread and are not in use yet.
@@ -138,7 +142,7 @@ pub fn run() -> Result<(), String> {
         worker: None,
         hwnd,
         main_hwnd: Cell::new(null_mut()),
-        icon,
+        icons,
         icon_added: Cell::new(false),
         settings_path,
         taskbar_created: unsafe {
@@ -170,7 +174,12 @@ pub fn run() -> Result<(), String> {
             return Err(format!("Could not start HID worker: {error}"));
         }
     };
-    let main_window = match crate::window::MainWindow::create(instance, &context) {
+    let main_window = match crate::window::MainWindow::create(
+        instance,
+        &context,
+        context.icons.normal,
+        context.icons.small,
+    ) {
         Ok(window) => window,
         Err(error) => {
             if let Some(worker) = context.worker.take() {
@@ -210,11 +219,11 @@ pub fn run() -> Result<(), String> {
     }
     unsafe {
         // SAFETY: The UI thread owns both resources; DestroyWindow is harmless if destruction
-        // already completed, and the icon was created by CreateIcon.
+        // already completed, and both icons were created by CreateIconIndirect.
         DestroyWindow(context.hwnd);
-        DestroyIcon(context.icon);
         UnregisterClassW(class_name.as_ptr(), instance);
     }
+    context.icons.destroy();
     drop(mutex);
     if message_loop_failed {
         Err("The Windows message loop failed".into())
@@ -228,7 +237,7 @@ pub(crate) struct AppContext {
     worker: Option<Worker>,
     hwnd: HWND,
     main_hwnd: Cell<HWND>,
-    icon: HICON,
+    icons: AppIcons,
     icon_added: Cell<bool>,
     settings_path: Option<PathBuf>,
     taskbar_created: u32,
@@ -238,7 +247,7 @@ impl AppContext {
     fn add_icon(&self) -> bool {
         let mut data = self.icon_data(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP);
         data.uCallbackMessage = WM_TRAY;
-        data.hIcon = self.icon;
+        data.hIcon = self.icons.small;
         copy_wide(&self.snapshot().tooltip(), &mut data.szTip);
         let added = unsafe {
             // SAFETY: data has the documented size, valid window, owned icon, and fixed buffers.
@@ -411,7 +420,7 @@ impl AppContext {
             state.apply_settings(&settings);
             state.settings_notice = Some(match result {
                 Ok(()) => "Settings saved".into(),
-                Err(error) => format!("Settings are active but were not saved: {error}"),
+                Err(_) => "Settings could not be saved".into(),
             });
         }
         crate::window::state_changed(self.main_hwnd.get());
@@ -439,9 +448,9 @@ impl AppContext {
         unsafe {
             // SAFETY: Resources were created by this thread and have not been released.
             DestroyWindow(self.hwnd);
-            DestroyIcon(self.icon);
             UnregisterClassW(class_name, instance);
         }
+        self.icons.destroy();
     }
 }
 
@@ -534,32 +543,129 @@ fn append(menu: *mut c_void, flags: u32, id: usize, text: &str) {
     }
 }
 
-fn create_icon(instance: HINSTANCE) -> Result<HICON, String> {
-    let and_mask = [0xffu8; 128];
-    let mut xor_mask = [0u8; 128];
-    for y in 4..27 {
-        for x in 8..24 {
-            let dx = x as i32 * 2 - 31;
-            let dy = y as i32 - 15;
-            let edge = (dx * dx + dy * dy * 2) >= 205 && (dx * dx + dy * dy * 2) <= 285;
-            if edge || (x == 15 && (5..12).contains(&y)) {
-                set_icon_bit(&mut xor_mask, x, y);
+pub(crate) struct AppIcons {
+    pub(crate) normal: HICON,
+    pub(crate) small: HICON,
+}
+
+impl AppIcons {
+    fn create(instance: HINSTANCE) -> Result<Self, String> {
+        let normal = create_icon(instance, 32)?;
+        let small = match create_icon(instance, 16) {
+            Ok(icon) => icon,
+            Err(error) => {
+                unsafe {
+                    // SAFETY: normal was created above and has not been shared yet.
+                    DestroyIcon(normal);
+                }
+                return Err(error);
             }
-        }
+        };
+        Ok(Self { normal, small })
     }
-    let icon = unsafe {
-        // SAFETY: Both masks contain exactly 32 rows of 32 one-bit pixels.
-        CreateIcon(instance, 32, 32, 1, 1, and_mask.as_ptr(), xor_mask.as_ptr())
-    };
-    if icon.is_null() {
-        Err("Could not create the LogiPeek tray icon".into())
-    } else {
-        Ok(icon)
+
+    fn destroy(&self) {
+        unsafe {
+            // SAFETY: The two distinct handles are owned by AppIcons and destroyed after every
+            // window class and tray registration that references them has been released.
+            DestroyIcon(self.small);
+            DestroyIcon(self.normal);
+        }
     }
 }
 
-fn set_icon_bit(mask: &mut [u8; 128], x: usize, y: usize) {
-    mask[y * 4 + x / 8] |= 0x80 >> (x % 8);
+fn create_icon(_instance: HINSTANCE, size: usize) -> Result<HICON, String> {
+    let bitmap = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size as i32,
+            biHeight: -(size as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = null_mut();
+    let color = unsafe {
+        // SAFETY: bitmap describes a top-down 32-bit DIB and bits receives its pixel storage.
+        CreateDIBSection(
+            null_mut(),
+            &bitmap,
+            DIB_RGB_COLORS,
+            &mut bits,
+            null_mut(),
+            0,
+        )
+    };
+    if color.is_null() || bits.is_null() {
+        if !color.is_null() {
+            unsafe {
+                // SAFETY: color is an owned DIB handle returned by CreateDIBSection above.
+                DeleteObject(color);
+            }
+        }
+        return Err(format!(
+            "Could not create the {size}px LogiPeek color bitmap"
+        ));
+    }
+    let pixels = unsafe {
+        // SAFETY: CreateDIBSection allocated exactly size * size 32-bit pixels above.
+        std::slice::from_raw_parts_mut(bits.cast::<u32>(), size * size)
+    };
+    pixels.fill(0);
+    for y in 0..size {
+        for x in 0..size {
+            let dx = ((x * 2 + 1) as i32 * 32 / size as i32) - 32;
+            let dy = ((y * 2 + 1) as i32 * 32 / size as i32) - 32;
+            if dx * dx + dy * dy <= 29 * 29 {
+                pixels[y * size + x] = 0xff00_7aff;
+            }
+            let mouse = dx * dx * 3 + dy * dy;
+            let edge = (330..=570).contains(&mouse) && (-23..=23).contains(&dy);
+            let wheel = dx.abs() <= (48 / size as i32).max(2) && (-18..=-5).contains(&dy);
+            if edge || wheel {
+                pixels[y * size + x] = 0xffff_ffff;
+            }
+        }
+    }
+    let mask_stride = size.div_ceil(16) * 2;
+    let mask_bits = vec![0u8; mask_stride * size];
+    let mask = unsafe {
+        // SAFETY: mask_bits holds word-aligned one-bit scanlines for the requested dimensions.
+        CreateBitmap(
+            size as i32,
+            size as i32,
+            1,
+            1,
+            mask_bits.as_ptr().cast::<c_void>(),
+        )
+    };
+    if mask.is_null() {
+        unsafe {
+            DeleteObject(color);
+        }
+        return Err(format!("Could not create the {size}px LogiPeek mask"));
+    }
+    let info = ICONINFO {
+        fIcon: 1,
+        hbmMask: mask,
+        hbmColor: color,
+        ..Default::default()
+    };
+    let icon = unsafe {
+        // SAFETY: ICONINFO refers to live mask and color bitmaps for the duration of the call.
+        let icon = CreateIconIndirect(&info);
+        DeleteObject(mask);
+        DeleteObject(color);
+        icon
+    };
+    if icon.is_null() {
+        Err(format!("Could not create the {size}px LogiPeek icon"))
+    } else {
+        Ok(icon)
+    }
 }
 
 fn wide(value: &str) -> Vec<u16> {
