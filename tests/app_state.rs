@@ -6,7 +6,7 @@ use logipeek::hid::{
     device::{Endpoint, FeatureResult, Interface},
     features::{
         battery::{Battery, Charging},
-        dpi::{DpiValues, SensorDpi},
+        dpi::{DpiValues, SensorDpi, SetDpiOutcome},
     },
     hidpp::{Feature, Protocol},
 };
@@ -189,5 +189,33 @@ fn operation_status_never_changes_current_dpi_preview_truth() {
     assert_eq!(
         state.operation_text(),
         "DPI change failed; refresh the device and try again"
+    );
+}
+
+#[test]
+fn dpi_outcomes_update_only_trustworthy_hardware_values() {
+    let mut state = AppState::default();
+    state.current_dpi = Some(1300);
+    state.battery_percent = Some(72);
+
+    state.apply_dpi_outcome(&SetDpiOutcome::TimedOutConfirmed { current: 1350 });
+    assert_eq!(state.current_dpi, Some(1350));
+    assert_eq!(state.operation, OperationStatus::Verified(1350));
+    assert_eq!(state.battery_percent, Some(72));
+
+    state.apply_dpi_outcome(&SetDpiOutcome::AcknowledgedMismatch { actual: 1300 });
+    assert_eq!(state.current_dpi, Some(1300));
+    assert_eq!(
+        state.operation,
+        OperationStatus::Failed(OperationError::Remains(1300))
+    );
+
+    state.apply_dpi_outcome(&SetDpiOutcome::TimedOutUnverified {
+        error: logipeek::hid::hidpp::Error::Timeout,
+    });
+    assert_eq!(state.current_dpi, Some(1300));
+    assert_eq!(
+        state.operation,
+        OperationStatus::Failed(OperationError::NotVerified)
     );
 }

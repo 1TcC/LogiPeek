@@ -1,8 +1,5 @@
 use super::state::{AppState, OperationError, OperationStatus};
-use crate::hid::{
-    device::{self, ScanOptions},
-    features::dpi::SetDpiOutcome,
-};
+use crate::hid::device::{self, ScanOptions};
 use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
@@ -60,25 +57,13 @@ fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: i
             Ok(Command::RefreshAll) => refresh_all(&state),
             Ok(Command::SetDpi(value)) => {
                 let result = device::set_unique_runtime_dpi(value);
-                refresh_all(&state);
                 if let Ok(mut current) = state.lock() {
-                    current.operation = match result {
-                        Ok(report) => match report.outcome {
-                            SetDpiOutcome::Verified { current }
-                            | SetDpiOutcome::TimedOutConfirmed { current } => {
-                                OperationStatus::Verified(current)
-                            }
-                            SetDpiOutcome::AcknowledgedMismatch { actual }
-                            | SetDpiOutcome::TimedOutDifferent { actual } => {
-                                OperationStatus::Failed(OperationError::Remains(actual))
-                            }
-                            SetDpiOutcome::AcknowledgedUnverified { .. }
-                            | SetDpiOutcome::TimedOutUnverified { .. } => {
-                                OperationStatus::Failed(OperationError::NotVerified)
-                            }
-                        },
-                        Err(_) => OperationStatus::Failed(OperationError::Failed),
-                    };
+                    match result {
+                        Ok(report) => current.apply_dpi_outcome(&report.outcome),
+                        Err(_) => {
+                            current.operation = OperationStatus::Failed(OperationError::Failed)
+                        }
+                    }
                 }
             }
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,

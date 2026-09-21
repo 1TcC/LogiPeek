@@ -19,15 +19,19 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
         Gdi::{
-            BeginPaint, COLOR_WINDOW, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET,
-            DeleteObject, Ellipse, EndPaint, FillRect, GetSysColor, GetTextExtentPoint32W, HDC,
-            HFONT, InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
-            RoundRect, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+            BeginPaint, BitBlt, COLOR_WINDOW, CreateCompatibleBitmap, CreateCompatibleDC,
+            CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject,
+            Ellipse, EndPaint, FillRect, GetSysColor, GetTextExtentPoint32W, HDC, HFONT,
+            InvalidateRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RoundRect,
+            SRCCOPY, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
         },
     },
     UI::{
         HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow},
-        Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, VK_F5, VK_RETURN, VK_TAB},
+        Input::KeyboardAndMouse::{
+            ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            VK_F5, VK_RETURN, VK_TAB,
+        },
         WindowsAndMessaging::{
             CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
             GWLP_USERDATA, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, HICON, ICON_BIG,
@@ -47,6 +51,7 @@ const CLASS_NAME: &str = "LogiPeek.Settings.Window";
 const CLIENT_WIDTH: i32 = 400;
 const CLIENT_HEIGHT: i32 = 580;
 const WM_REDRAW: u32 = WM_APP + 10;
+const WM_MOUSELEAVE: u32 = 0x02a3;
 const REFRESH_RECT: (i32, i32, i32, i32) = (344, 18, 36, 36);
 const SLIDER_RECT: (i32, i32, i32, i32) = (28, 276, 344, 42);
 const SAVE_RECT: (i32, i32, i32, i32) = (286, 388, 78, 28);
@@ -69,6 +74,7 @@ struct WindowState {
     pending_theme: Cell<Theme>,
     hover: Cell<Option<HitTarget>>,
     pressed: Cell<Option<HitTarget>>,
+    tracking_leave: Cell<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +164,7 @@ impl MainWindow {
             pending_theme: Cell::new(snapshot.theme),
             hover: Cell::new(None),
             pressed: Cell::new(None),
+            tracking_leave: Cell::new(false),
         });
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut bounds = RECT {
@@ -390,10 +397,18 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             return 0;
         }
         WM_MOUSEMOVE => {
+            track_mouse_leave(state);
             if state.dragging.get() {
                 preview_slider(state, point_from_lparam(lparam).0);
             } else {
                 update_hover(state, point_from_lparam(lparam));
+            }
+            return 0;
+        }
+        WM_MOUSELEAVE => {
+            state.tracking_leave.set(false);
+            if state.hover.take().is_some() {
+                invalidate(hwnd);
             }
             return 0;
         }
@@ -477,6 +492,8 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 }
             }
             state.preview.set(None);
+            state.hover.set(None);
+            state.tracking_leave.set(false);
             unsafe {
                 // SAFETY: Hiding the owned settings window implements close-to-tray.
                 ShowWindow(hwnd, SW_HIDE);
@@ -571,7 +588,7 @@ fn hit_target(state: &WindowState, x: i32, y: i32) -> Option<HitTarget> {
 
 fn update_hover(state: &WindowState, point: (i32, i32)) {
     let target = hit_target(state, point.0, point.1);
-    if state.hover.replace(target) != target {
+    if set_hover(&state.hover, target) {
         invalidate(state.hwnd.get());
     }
     let cursor = if target.is_some() {
@@ -582,6 +599,29 @@ fn update_hover(state: &WindowState, point: (i32, i32)) {
     unsafe {
         // SAFETY: Both identifiers select shared system cursors; the window does not own them.
         SetCursor(LoadCursorW(null_mut(), cursor));
+    }
+}
+
+fn set_hover(hover: &Cell<Option<HitTarget>>, target: Option<HitTarget>) -> bool {
+    hover.replace(target) != target
+}
+
+fn track_mouse_leave(state: &WindowState) {
+    if state.tracking_leave.get() {
+        return;
+    }
+    let mut event = TRACKMOUSEEVENT {
+        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: state.hwnd.get(),
+        dwHoverTime: 0,
+    };
+    if unsafe {
+        // SAFETY: event is initialized for this live window and remains valid for the call.
+        TrackMouseEvent(&mut event)
+    } != 0
+    {
+        state.tracking_leave.set(true);
     }
 }
 
@@ -607,8 +647,10 @@ fn preview_slider(state: &WindowState, x: i32) {
     let dpi = state.dpi.get();
     let left = scale(38, dpi);
     let width = scale(324, dpi).max(1);
-    state.preview.set(slider::value_at(values, x - left, width));
-    invalidate(state.hwnd.get());
+    let preview = slider::value_at(values, x - left, width);
+    if state.preview.replace(preview) != preview {
+        invalidate(state.hwnd.get());
+    }
 }
 
 fn commit_slider(state: &WindowState, value: u16) {
@@ -680,22 +722,60 @@ fn paint(state: &WindowState) {
     if dc.is_null() {
         return;
     }
-    let dpi = state.dpi.get();
-    let snapshot = app(state).snapshot();
-    let palette = palette(state.pending_theme.get());
     let mut client = RECT::default();
     unsafe {
         // SAFETY: client is writable and hwnd is the live settings window.
         GetClientRect(hwnd, &mut client);
     }
+    let width = client.right - client.left;
+    let height = client.bottom - client.top;
+    let memory_dc = unsafe {
+        // SAFETY: dc is the live paint DC and the returned compatible DC is owned below.
+        CreateCompatibleDC(dc)
+    };
+    let mut rendered = false;
+    if !memory_dc.is_null() {
+        let bitmap = unsafe {
+            // SAFETY: dc is live and the dimensions come from the current client rectangle.
+            CreateCompatibleBitmap(dc, width, height)
+        };
+        if !bitmap.is_null() {
+            let old_bitmap = unsafe {
+                // SAFETY: memory_dc and bitmap are compatible owned GDI resources.
+                SelectObject(memory_dc, bitmap)
+            };
+            paint_client(state, memory_dc, client);
+            unsafe {
+                // SAFETY: Both DCs are live and cover the same client-sized pixel rectangle.
+                BitBlt(dc, 0, 0, width, height, memory_dc, 0, 0, SRCCOPY);
+                // SAFETY: Restore the original bitmap before deleting the owned bitmap.
+                SelectObject(memory_dc, old_bitmap);
+                DeleteObject(bitmap);
+            }
+            rendered = true;
+        }
+        unsafe {
+            // SAFETY: memory_dc was created by CreateCompatibleDC and is no longer in use.
+            DeleteDC(memory_dc);
+        }
+    }
+    if !rendered {
+        paint_client(state, dc, client);
+    }
+    unsafe {
+        // SAFETY: Completes the BeginPaint call above.
+        EndPaint(hwnd, &paint);
+    }
+}
+
+fn paint_client(state: &WindowState, dc: HDC, client: RECT) {
+    let dpi = state.dpi.get();
+    let snapshot = app(state).snapshot();
+    let palette = palette(state.pending_theme.get());
     fill(dc, client, palette.background);
 
     if snapshot.language.is_none() {
         paint_language_picker(state, dc, palette, dpi);
-        unsafe {
-            // SAFETY: Completes the BeginPaint call above.
-            EndPaint(hwnd, &paint);
-        }
         return;
     }
 
@@ -976,10 +1056,6 @@ fn paint(state: &WindowState) {
                 DeleteObject(object);
             }
         }
-    }
-    unsafe {
-        // SAFETY: Completes the BeginPaint call above.
-        EndPaint(hwnd, &paint);
     }
 }
 
@@ -1521,6 +1597,83 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::{
+        Graphics::Gdi::{
+            CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject,
+        },
+        System::Threading::{GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources},
+    };
+
+    #[test]
+    fn repeated_mouse_moves_inside_one_target_do_not_change_hover() {
+        let hover = Cell::new(None);
+        assert!(set_hover(&hover, Some(HitTarget::Refresh)));
+        for _ in 0..200 {
+            assert!(!set_hover(&hover, Some(HitTarget::Refresh)));
+        }
+        assert!(set_hover(&hover, None));
+    }
+
+    fn draw_test_hover_frame(screen: HDC, frame: usize) {
+        let dc = unsafe { CreateCompatibleDC(screen) };
+        assert!(!dc.is_null());
+        let bitmap = unsafe { CreateCompatibleBitmap(screen, CLIENT_WIDTH, CLIENT_HEIGHT) };
+        assert!(!bitmap.is_null());
+        let old_bitmap = unsafe { SelectObject(dc, bitmap) };
+        let button_font = font(96, 12, 400);
+        assert!(!button_font.is_null());
+        draw_card(dc, palette(Theme::Light), 96, (20, 20, 360, 80));
+        draw_button(
+            dc,
+            button_font,
+            palette(Theme::Light),
+            96,
+            Button {
+                rect: (30, 40, 100, 30),
+                label: "Hover",
+                enabled: true,
+                selected: false,
+                hovered: frame.is_multiple_of(2),
+                pressed: false,
+            },
+        );
+        unsafe {
+            // SAFETY: Restore selections before deleting every frame-owned GDI resource.
+            DeleteObject(button_font);
+            SelectObject(dc, old_bitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn two_hundred_buffered_hover_frames_do_not_leak_gui_resources() {
+        let process = unsafe {
+            // SAFETY: GetCurrentProcess returns a non-owning pseudo-handle.
+            GetCurrentProcess()
+        };
+        let screen = unsafe {
+            // SAFETY: A null HWND obtains the screen DC, released below.
+            GetDC(null_mut())
+        };
+        assert!(!screen.is_null());
+        // Allow one-time GDI/font initialization before measuring steady-state handles.
+        draw_test_hover_frame(screen, 0);
+        let gdi_before = unsafe { GetGuiResources(process, GR_GDIOBJECTS) };
+        let user_before = unsafe { GetGuiResources(process, GR_USEROBJECTS) };
+        for frame in 0..200 {
+            draw_test_hover_frame(screen, frame);
+        }
+        unsafe {
+            // SAFETY: screen was obtained once by GetDC(NULL) above.
+            ReleaseDC(null_mut(), screen);
+        }
+        let gdi_after = unsafe { GetGuiResources(process, GR_GDIOBJECTS) };
+        let user_after = unsafe { GetGuiResources(process, GR_USEROBJECTS) };
+        assert!(gdi_after <= gdi_before);
+        assert!(user_after <= user_before);
+    }
 
     #[test]
     fn compact_controls_fit_at_supported_test_dpis() {

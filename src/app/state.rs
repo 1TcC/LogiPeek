@@ -7,7 +7,7 @@ use crate::hid::{
     device::{Endpoint, Interface},
     features::{
         battery::{Charging, Level},
-        dpi::{self, DpiValues},
+        dpi::{self, DpiValues, SetDpiOutcome},
     },
     hidpp::Protocol,
 };
@@ -236,6 +236,24 @@ impl AppState {
                     .is_some_and(|supported| dpi::supports_dpi(supported, value)),
             checked: self.status == DeviceStatus::Single && self.current_dpi == Some(value),
         })
+    }
+
+    pub fn apply_dpi_outcome(&mut self, outcome: &SetDpiOutcome) {
+        match outcome {
+            SetDpiOutcome::Verified { current } | SetDpiOutcome::TimedOutConfirmed { current } => {
+                self.current_dpi = Some(*current);
+                self.operation = OperationStatus::Verified(*current);
+            }
+            SetDpiOutcome::AcknowledgedMismatch { actual }
+            | SetDpiOutcome::TimedOutDifferent { actual } => {
+                self.current_dpi = Some(*actual);
+                self.operation = OperationStatus::Failed(OperationError::Remains(*actual));
+            }
+            SetDpiOutcome::AcknowledgedUnverified { .. }
+            | SetDpiOutcome::TimedOutUnverified { .. } => {
+                self.operation = OperationStatus::Failed(OperationError::NotVerified);
+            }
+        }
     }
 
     pub fn battery_text(&self) -> String {
