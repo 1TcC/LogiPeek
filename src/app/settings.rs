@@ -25,6 +25,10 @@ pub struct Settings {
     pub presets: [u16; 4],
     pub theme: Theme,
     pub language: Option<Language>,
+    pub startup: bool,
+    pub battery_notifications: bool,
+    pub battery_threshold: u8,
+    pub device: Option<String>,
 }
 
 impl Default for Settings {
@@ -33,6 +37,10 @@ impl Default for Settings {
             presets: DEFAULT_PRESETS,
             theme: Theme::System,
             language: None,
+            startup: false,
+            battery_notifications: true,
+            battery_threshold: 20,
+            device: None,
         }
     }
 }
@@ -66,6 +74,15 @@ impl Settings {
                         _ => None,
                     };
                 }
+                "startup" => settings.startup = parse_bool(value, defaults.startup),
+                "battery_notifications" => {
+                    settings.battery_notifications =
+                        parse_bool(value, defaults.battery_notifications)
+                }
+                "battery_threshold" => {
+                    settings.battery_threshold = parse_threshold(value, defaults.battery_threshold)
+                }
+                "device" => settings.device = parse_device(value),
                 _ => {}
             }
         }
@@ -83,9 +100,19 @@ impl Settings {
             Some(Language::SimplifiedChinese) => "language=zh-CN\n",
             None => "",
         };
+        let device = self
+            .device
+            .as_deref()
+            .map_or(String::new(), |value| format!("device={value}\n"));
         format!(
-            "preset1={}\npreset2={}\npreset3={}\npreset4={}\ntheme={theme}\n{language}",
-            self.presets[0], self.presets[1], self.presets[2], self.presets[3]
+            "preset1={}\npreset2={}\npreset3={}\npreset4={}\ntheme={theme}\n{language}startup={}\nbattery_notifications={}\nbattery_threshold={}\n{device}",
+            self.presets[0],
+            self.presets[1],
+            self.presets[2],
+            self.presets[3],
+            self.startup,
+            self.battery_notifications,
+            self.battery_threshold
         )
     }
 
@@ -116,4 +143,33 @@ fn parse_preset(value: &str, fallback: u16) -> u16 {
         .ok()
         .filter(|value| *value > 0)
         .unwrap_or(fallback)
+}
+
+fn parse_bool(value: &str, fallback: bool) -> bool {
+    match value {
+        "true" => true,
+        "false" => false,
+        _ => fallback,
+    }
+}
+
+fn parse_threshold(value: &str, fallback: u8) -> u8 {
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|v| (5..=50).contains(v) && v % 5 == 0)
+        .unwrap_or(fallback)
+}
+
+fn parse_device(value: &str) -> Option<String> {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
 }

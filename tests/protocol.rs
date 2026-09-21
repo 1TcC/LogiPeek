@@ -974,6 +974,7 @@ fn dpi_read_propagates_count_and_midstream_errors() {
 fn endpoint_with_features(features: Vec<FeatureResult>) -> Endpoint {
     Endpoint {
         index: 1,
+        opaque_id: "test-device".into(),
         protocol: Ok(Protocol::Feature { major: 2, minor: 0 }),
         features,
         battery: None,

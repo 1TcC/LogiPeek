@@ -2,6 +2,7 @@ use super::settings::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextKey {
+    Device,
     Appearance,
     Applying,
     Battery,
@@ -41,12 +42,30 @@ pub enum TextKey {
     Verified,
     Welcome,
     WorkerBusy,
+    Loading,
+    StartWithWindows,
+    On,
+    Off,
+    LowBatteryNotifications,
+    NotifyBelow,
+    StartupUpdateFailed,
+    LowBatteryMessage,
 }
 
 pub fn text(language: Language, key: TextKey) -> &'static str {
     use Language::{English, SimplifiedChinese};
     use TextKey::*;
     match (language, key) {
+        (English, Device) => "Device",
+        (SimplifiedChinese, Device) => "设备",
+        (SimplifiedChinese, Loading) => "加载中",
+        (SimplifiedChinese, StartWithWindows) => "开机启动",
+        (SimplifiedChinese, On) => "开启",
+        (SimplifiedChinese, Off) => "关闭",
+        (SimplifiedChinese, LowBatteryNotifications) => "低电量通知",
+        (SimplifiedChinese, NotifyBelow) => "低于此值时通知",
+        (SimplifiedChinese, StartupUpdateFailed) => "无法更新开机启动设置",
+        (SimplifiedChinese, LowBatteryMessage) => "电量低于设定阈值",
         (English, Appearance) => "Appearance",
         (English, Applying) => "Applying",
         (English, Battery) => "Battery",
@@ -86,6 +105,14 @@ pub fn text(language: Language, key: TextKey) -> &'static str {
         (English, Verified) => "Verified",
         (English, Welcome) => "Welcome to LogiPeek",
         (English, WorkerBusy) => "HID worker is busy; try again",
+        (English, Loading) => "Loading",
+        (English, StartWithWindows) => "Start with Windows",
+        (English, On) => "On",
+        (English, Off) => "Off",
+        (English, LowBatteryNotifications) => "Low-battery notifications",
+        (English, NotifyBelow) => "Notify below",
+        (English, StartupUpdateFailed) => "Startup setting could not be updated",
+        (English, LowBatteryMessage) => "Battery is below the threshold",
         (SimplifiedChinese, Appearance) => "外观",
         (SimplifiedChinese, Applying) => "正在应用",
         (SimplifiedChinese, Battery) => "电量",
@@ -125,5 +152,12 @@ pub fn text(language: Language, key: TextKey) -> &'static str {
         (SimplifiedChinese, Verified) => "已验证",
         (SimplifiedChinese, Welcome) => "欢迎使用 LogiPeek",
         (SimplifiedChinese, WorkerBusy) => "HID 工作线程正忙，请重试",
+    }
+}
+
+pub fn low_battery_message(language: Language, percentage: u8) -> String {
+    match language {
+        Language::English => format!("Mouse battery is low: {percentage}%"),
+        Language::SimplifiedChinese => format!("鼠标电量较低：{percentage}%"),
     }
 }

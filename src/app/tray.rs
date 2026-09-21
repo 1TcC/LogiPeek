@@ -1,11 +1,13 @@
 use logipeek::app::{
+    battery_alert::BatteryAlertState,
     settings::{Language, Settings},
+    startup::{self, StartupStore},
     state::{AppState, OperationError, OperationStatus, SettingsNotice},
-    text::{TextKey, text},
+    text::{TextKey, low_battery_message, text},
     worker::{Command, Worker},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     env,
     ffi::c_void,
     mem::size_of,
@@ -25,14 +27,22 @@ use windows_sys::Win32::{
         DeleteObject,
     },
     Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
-    System::{Console::FreeConsole, LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
+    System::{
+        Console::FreeConsole,
+        LibraryLoader::GetModuleHandleW,
+        Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey,
+            RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+        },
+        Threading::CreateMutexW,
+    },
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
         Input::Ime::ImmDisableIME,
         Shell::{
-            NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-            NIM_SETFOCUS, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
-            Shell_NotifyIconW,
+            NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD,
+            NIM_DELETE, NIM_MODIFY, NIM_SETFOCUS, NIM_SETVERSION, NIN_BALLOONUSERCLICK, NIN_SELECT,
+            NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -57,7 +67,7 @@ const PRESET_FIRST: u32 = 100;
 const REFRESH_ID: u32 = 200;
 const EXIT_ID: u32 = 201;
 
-pub fn run() -> Result<(), String> {
+pub fn run(startup_launch: bool) -> Result<(), String> {
     unsafe {
         // SAFETY: This runs before either application window is created. A false return can
         // mean awareness was already fixed by the host or manifest, so graceful fallback is safe.
@@ -131,10 +141,11 @@ pub fn run() -> Result<(), String> {
         }
     };
     let settings_path = settings_path();
-    let settings = settings_path
+    let mut settings = settings_path
         .as_deref()
         .map(Settings::load)
         .unwrap_or_default();
+    settings.startup = current_startup_state().unwrap_or(false);
     let mut initial_state = AppState::default();
     initial_state.apply_settings(&settings);
     let state = Arc::new(Mutex::new(initial_state));
@@ -150,6 +161,7 @@ pub fn run() -> Result<(), String> {
             // SAFETY: The string is NUL-terminated and valid for this call.
             RegisterWindowMessageW(taskbar_created_name.as_ptr())
         },
+        battery_alert: RefCell::new(BatteryAlertState::default()),
     });
     unsafe {
         // SAFETY: Context is boxed and remains at a stable address through the message loop.
@@ -190,7 +202,9 @@ pub fn run() -> Result<(), String> {
             return Err(error);
         }
     };
-    main_window.show();
+    if !startup_launch {
+        main_window.show();
+    }
     unsafe {
         // SAFETY: Detaching affects only this successfully initialized no-argument tray process.
         FreeConsole();
@@ -242,6 +256,7 @@ pub(crate) struct AppContext {
     icon_added: Cell<bool>,
     settings_path: Option<PathBuf>,
     taskbar_created: u32,
+    battery_alert: RefCell<BatteryAlertState>,
 }
 
 impl AppContext {
@@ -281,6 +296,34 @@ impl AppContext {
         copy_wide(&self.snapshot().tooltip(), &mut data.szTip);
         unsafe {
             // SAFETY: The tray icon is registered and data owns a terminated tooltip buffer.
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
+
+    fn maybe_show_battery_alert(&self) {
+        let state = self.snapshot();
+        let notify = self.battery_alert.borrow_mut().evaluate(
+            state.selected_device.as_deref(),
+            state.battery_notifications,
+            state.battery_threshold,
+            state.battery_percent,
+            state.charging.as_ref(),
+        );
+        if !notify {
+            return;
+        }
+        let Some(percentage) = state.battery_percent else {
+            return;
+        };
+        let mut data = self.icon_data(NIF_INFO);
+        copy_wide("LogiPeek", &mut data.szInfoTitle);
+        copy_wide(
+            &low_battery_message(state.ui_language(), percentage),
+            &mut data.szInfo,
+        );
+        data.dwInfoFlags = NIIF_WARNING;
+        unsafe {
+            // SAFETY: The registered tray icon owns the fixed notification buffers.
             Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
@@ -448,6 +491,70 @@ impl AppContext {
         crate::window::state_changed(self.main_hwnd.get());
     }
 
+    pub(crate) fn set_startup(&self, enabled: bool) {
+        let result: Result<(), String> = (|| {
+            let executable = env::current_exe().map_err(|error| error.to_string())?;
+            let executable = executable.to_string_lossy();
+            let mut store = RegistryStore::current_user()?;
+            if enabled {
+                startup::enable(&mut store, &executable)?;
+            } else {
+                startup::disable(&mut store)?;
+            }
+            let actual = startup::is_current(&mut store, &executable)?;
+            if actual != enabled {
+                return Err("The LogiPeek Run value did not match the requested state".into());
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            let mut settings = self.snapshot().settings();
+            settings.startup = enabled;
+            self.save_settings(settings);
+            if let Ok(mut state) = self.state.lock() {
+                state.startup = enabled;
+            }
+        } else if let Ok(mut state) = self.state.lock() {
+            state.settings_notice = Some(SettingsNotice::StartupFailed);
+        }
+        crate::window::state_changed(self.main_hwnd.get());
+    }
+
+    pub(crate) fn set_battery_notifications(&self, enabled: bool) {
+        let mut settings = self.snapshot().settings();
+        settings.battery_notifications = enabled;
+        self.save_settings(settings);
+    }
+
+    pub(crate) fn set_battery_threshold(&self, threshold: u8) {
+        let mut settings = self.snapshot().settings();
+        settings.battery_threshold = threshold.clamp(5, 50);
+        self.save_settings(settings);
+    }
+
+    pub(crate) fn select_device(&self, device: String) {
+        let valid = self
+            .state
+            .lock()
+            .is_ok_and(|state| state.devices.iter().any(|option| option.id == device));
+        if !valid {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.begin_device_switch(device.clone());
+        }
+        let settings = self.snapshot().settings();
+        self.save_settings(settings);
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.send(Command::SelectDevice(device)));
+        if !sent && let Ok(mut state) = self.state.lock() {
+            state.operation = OperationStatus::Failed(OperationError::WorkerBusy);
+        }
+        crate::window::state_changed(self.main_hwnd.get());
+    }
+
     pub(crate) fn set_language(&self, language: Language) {
         let mut settings = self.snapshot().settings();
         settings.language = Some(language);
@@ -519,12 +626,13 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 let event = lparam as u32 & 0xffff;
                 if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP) {
                     context.show_menu();
-                } else if matches!(event, WM_LBUTTONDBLCLK | NIN_SELECT) {
+                } else if matches!(event, WM_LBUTTONDBLCLK | NIN_SELECT | NIN_BALLOONUSERCLICK) {
                     crate::window::show(context.main_hwnd.get());
                 }
                 return 0;
             }
             WM_STATE_UPDATED => {
+                context.maybe_show_battery_alert();
                 context.update_tooltip();
                 crate::window::state_changed(context.main_hwnd.get());
                 return 0;
@@ -740,6 +848,133 @@ fn save_settings_atomic(settings: &Settings, path: &Path) -> Result<(), String> 
         let _ = std::fs::remove_file(temporary);
         Err("atomic settings replacement failed".into())
     }
+}
+
+struct RegistryStore {
+    key: HKEY,
+}
+
+impl RegistryStore {
+    fn current_user() -> Result<Self, String> {
+        let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+        let mut key = null_mut();
+        let status = unsafe {
+            // SAFETY: subkey is terminated UTF-16 and key is a writable output pointer.
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_SET_VALUE,
+                &mut key,
+            )
+        };
+        if status == 0 {
+            Ok(Self { key })
+        } else {
+            Err(format!(
+                "Could not open the current-user Run key ({status})"
+            ))
+        }
+    }
+}
+
+impl Drop for RegistryStore {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: RegistryStore owns the successfully opened key.
+            RegCloseKey(self.key);
+        }
+    }
+}
+
+impl StartupStore for RegistryStore {
+    fn read(&mut self, value: &str) -> Result<Option<String>, String> {
+        let name = wide(value);
+        let mut kind = 0u32;
+        let mut bytes = 0u32;
+        let status = unsafe {
+            // SAFETY: This size query supplies writable type and byte-count outputs.
+            RegQueryValueExW(
+                self.key,
+                name.as_ptr(),
+                null_mut(),
+                &mut kind,
+                null_mut(),
+                &mut bytes,
+            )
+        };
+        if status == 2 {
+            return Ok(None);
+        }
+        if status != 0 || kind != REG_SZ {
+            return Err(format!("Could not read the LogiPeek Run value ({status})"));
+        }
+        let mut data = vec![0u16; (bytes as usize).div_ceil(2)];
+        let status = unsafe {
+            // SAFETY: data is sized from the preceding query and bytes remains writable.
+            RegQueryValueExW(
+                self.key,
+                name.as_ptr(),
+                null_mut(),
+                &mut kind,
+                data.as_mut_ptr().cast::<u8>(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || kind != REG_SZ {
+            return Err(format!("Could not read the LogiPeek Run value ({status})"));
+        }
+        let length = data
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(data.len());
+        Ok(Some(String::from_utf16_lossy(&data[..length])))
+    }
+
+    fn write(&mut self, value: &str, data: &str) -> Result<(), String> {
+        let name = wide(value);
+        let data = wide(data);
+        let status = unsafe {
+            // SAFETY: name and data are terminated UTF-16 buffers valid for this call.
+            RegSetValueExW(
+                self.key,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr().cast::<u8>(),
+                (data.len() * size_of::<u16>()) as u32,
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not update the LogiPeek Run value ({status})"
+            ))
+        }
+    }
+
+    fn delete(&mut self, value: &str) -> Result<(), String> {
+        let name = wide(value);
+        let status = unsafe {
+            // SAFETY: name is a terminated UTF-16 value name for the owned Run key.
+            RegDeleteValueW(self.key, name.as_ptr())
+        };
+        if matches!(status, 0 | 2) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not remove the LogiPeek Run value ({status})"
+            ))
+        }
+    }
+}
+
+fn current_startup_state() -> Result<bool, String> {
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    let executable = executable.to_string_lossy();
+    let mut store = RegistryStore::current_user()?;
+    startup::is_current(&mut store, &executable)
 }
 
 struct SingleInstance(HANDLE);

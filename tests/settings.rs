@@ -21,14 +21,14 @@ fn old_settings_without_language_require_first_run_choice() {
 fn english_language_is_parsed() {
     let settings = Settings::parse("language=en\n");
     assert_eq!(settings.language, Some(Language::English));
-    assert!(settings.serialize().ends_with("language=en\n"));
+    assert!(settings.serialize().contains("language=en\n"));
 }
 
 #[test]
 fn simplified_chinese_language_is_parsed() {
     let settings = Settings::parse("language=zh-CN\n");
     assert_eq!(settings.language, Some(Language::SimplifiedChinese));
-    assert!(settings.serialize().ends_with("language=zh-CN\n"));
+    assert!(settings.serialize().contains("language=zh-CN\n"));
 }
 
 #[test]
@@ -60,7 +60,37 @@ fn themes_roundtrip() {
             presets: DEFAULT_PRESETS,
             theme,
             language: Some(Language::English),
+            ..Settings::default()
         };
         assert_eq!(Settings::parse(&settings.serialize()).theme, theme);
     }
+}
+
+#[test]
+fn phase_six_defaults_and_roundtrip_are_stable() {
+    let defaults = Settings::default();
+    assert!(!defaults.startup);
+    assert!(defaults.battery_notifications);
+    assert_eq!(defaults.battery_threshold, 20);
+    assert_eq!(defaults.device, None);
+
+    let parsed = Settings::parse(
+        "startup=true\nbattery_notifications=false\nbattery_threshold=35\ndevice=0123abcd\n",
+    );
+    assert!(parsed.startup);
+    assert!(!parsed.battery_notifications);
+    assert_eq!(parsed.battery_threshold, 35);
+    assert_eq!(parsed.device.as_deref(), Some("0123abcd"));
+    assert_eq!(Settings::parse(&parsed.serialize()), parsed);
+}
+
+#[test]
+fn malformed_phase_six_fields_fall_back_safely() {
+    let settings = Settings::parse(
+        "startup=yes\nbattery_notifications=1\nbattery_threshold=22\ndevice=raw path!\n",
+    );
+    assert!(!settings.startup);
+    assert!(settings.battery_notifications);
+    assert_eq!(settings.battery_threshold, 20);
+    assert_eq!(settings.device, None);
 }

@@ -32,6 +32,7 @@ fn interface(
         open_error: None,
         endpoints: vec![Endpoint {
             index: endpoint_index,
+            opaque_id: format!("device-{index}-{endpoint_index}"),
             protocol: Ok(Protocol::Feature { major: 2, minor: 0 }),
             features: vec![FeatureResult {
                 id: 0x2201,
@@ -167,6 +168,7 @@ fn custom_presets_share_state_and_unsupported_values_are_disabled() {
         presets: [450, 850, 1700, 3200],
         theme: Theme::Dark,
         language: None,
+        ..Settings::default()
     });
     let presets = state.presets();
     assert_eq!(state.theme, Theme::Dark);
@@ -218,4 +220,102 @@ fn dpi_outcomes_update_only_trustworthy_hardware_values() {
         state.operation,
         OperationStatus::Failed(OperationError::NotVerified)
     );
+}
+
+#[test]
+fn remembered_multi_device_selection_binds_battery_and_dpi() {
+    let interfaces = [
+        interface(
+            1,
+            1,
+            "Same Mouse",
+            Some(vec![sensor(800, DpiValues::List(vec![800]))]),
+            Some(81),
+        ),
+        interface(
+            2,
+            1,
+            "Same Mouse",
+            Some(vec![sensor(1600, DpiValues::List(vec![1600]))]),
+            Some(42),
+        ),
+    ];
+    let settings = Settings {
+        device: Some("device-2-1".into()),
+        ..Settings::default()
+    };
+    let state = AppState::from_scan_with_settings(&interfaces, &settings);
+    assert_eq!(state.status, DeviceStatus::Single);
+    assert_eq!(state.selected_device.as_deref(), Some("device-2-1"));
+    assert_eq!(state.battery_percent, Some(42));
+    assert_eq!(state.current_dpi, Some(1600));
+    assert_eq!(state.devices.len(), 2);
+    assert_ne!(state.devices[0].label, state.devices[1].label);
+    assert_eq!(state.devices.iter().filter(|item| item.selected).count(), 1);
+}
+
+#[test]
+fn missing_multi_device_selection_disables_writes() {
+    let interfaces = [
+        interface(1, 1, "A", None, Some(80)),
+        interface(2, 1, "B", None, Some(70)),
+    ];
+    let settings = Settings {
+        device: Some("missing".into()),
+        ..Settings::default()
+    };
+    let state = AppState::from_scan_with_settings(&interfaces, &settings);
+    assert_eq!(state.status, DeviceStatus::MultipleDevices);
+    assert_eq!(state.selected_device, None);
+    assert!(state.presets().iter().all(|preset| !preset.enabled));
+}
+
+#[test]
+fn device_switch_clears_old_values_and_invalidates_target() {
+    let mut state = AppState::from_scan(&[interface(
+        1,
+        1,
+        "Mouse",
+        Some(vec![sensor(800, DpiValues::List(vec![800]))]),
+        Some(80),
+    )]);
+    state.begin_device_switch("other-device".into());
+    assert_eq!(state.status, DeviceStatus::Unavailable);
+    assert_eq!(state.current_dpi, None);
+    assert_eq!(state.battery_percent, None);
+    assert_eq!(state.operation, OperationStatus::Loading);
+    assert_eq!(state.settings().device.as_deref(), Some("other-device"));
+}
+
+#[test]
+fn multi_device_battery_refresh_stays_on_selected_endpoint() {
+    let settings = Settings {
+        device: Some("device-2-1".into()),
+        ..Settings::default()
+    };
+    let full = [
+        interface(
+            1,
+            1,
+            "A",
+            Some(vec![sensor(800, DpiValues::List(vec![800]))]),
+            Some(90),
+        ),
+        interface(
+            2,
+            1,
+            "B",
+            Some(vec![sensor(1600, DpiValues::List(vec![1600]))]),
+            Some(60),
+        ),
+    ];
+    let mut state = AppState::from_scan_with_settings(&full, &settings);
+    let battery_only = [
+        interface(1, 1, "A", None, Some(89)),
+        interface(2, 1, "B", None, Some(55)),
+    ];
+    state.apply_battery_scan(&battery_only);
+    assert_eq!(state.selected_device.as_deref(), Some("device-2-1"));
+    assert_eq!(state.battery_percent, Some(55));
+    assert_eq!(state.current_dpi, Some(1600));
 }

@@ -12,7 +12,7 @@ It is for people who want a lightweight way to view mouse battery state and cont
 
 ## Status and goals
 
-With no arguments LogiPeek starts its native notification-area process and opens a compact settings window. CLI arguments still perform one operation and exit. The GUI, tray, and CLI share the same `0x2201` function 3 setter after a fresh safety preflight. One receiver setup was exercised on Windows on 2026-09-19; see the [hardware observation](docs/hidpp.md#baseline-hardware-observation). It does not claim model support or broad receiver compatibility, and forwarded-slot availability remains intermittent.
+With no arguments LogiPeek starts its native notification-area process and opens a compact settings window. The internal `--startup` launch enters tray-only mode; public CLI arguments still perform one operation and exit. GUI/tray writes use an in-memory validated target with fresh fast revalidation, while CLI writes keep the complete unique-target preflight. One receiver setup was exercised on Windows on 2026-09-19; see the [hardware observation](docs/hidpp.md#baseline-hardware-observation).
 
 Designed to support as many Logitech mice as practical through HID++ capability discovery. The automated suite contains 34 protocol tests plus state, settings, and slider tests.
 
@@ -30,11 +30,13 @@ Designed to support as many Logitech mice as practical through HID++ capability 
 - Provides `--devices`, `--diag`, `--battery`, `--dpi`, and `--set-dpi <DPI>` as one-shot commands.
 - Starts a native Win32 tray when run without arguments. Its menu shows current battery/DPI state, Refresh, Exit, and fixed 400/800/1600/3200 DPI choices. Unsupported choices stay visible but disabled, and the current choice is checked when it matches.
 - Refreshes battery state every 60 seconds on one blocking HID worker. DPI is read at startup, after a tray write, and on manual Refresh. A named mutex prevents duplicate tray instances without blocking CLI commands.
-- Shows a compact 400 x 580 logical-pixel, Per-Monitor-DPI-aware native Win32 settings window with battery state, a progress bar when exact percentage exists, current DPI, a capability-driven slider, four presets, inline operation status, and Refresh.
+- Shows a compact 400 x 640 logical-pixel, Per-Monitor-DPI-aware native Win32 settings window with battery state, current DPI, a capability-driven slider, presets, device selection, startup and low-battery controls, inline status, and Refresh.
 - Supports both discrete DPI lists and stepped ranges. Dragging updates only a pending preview; releasing commits at most one write through the same safe setter and returns to the hardware value after failure.
 - Lets users edit four preset slots, choose System, Light, or Dark appearance, and switch the window and tray live between English and Simplified Chinese. Presets unsupported by the current device remain saved but disabled.
 - Shows an in-window language picker on first run and after upgrade from settings without a valid `language` field; the normal settings page appears after the choice is saved.
-- Stores tolerant, human-readable settings in `%LOCALAPPDATA%\LogiPeek\settings.ini` using a synced temporary file and atomic same-volume replacement. No registry or database is used.
+- Stores tolerant, human-readable settings in `%LOCALAPPDATA%\LogiPeek\settings.ini` using a synced temporary file and atomic same-volume replacement. The optional Start with Windows switch manages only LogiPeek's current-user Run value; no service, scheduled task, or database is used.
+- Selects the only writable DPI device automatically. When multiple writable devices are present, it requires an explicit choice, persists only a derived opaque ID, and keeps Battery/DPI bound to that same endpoint.
+- Can show localized low-battery tray balloons for real percentages while discharging. Notifications default to 20%, fire once per crossing, and rearm only after a 5% recovery.
 - Closing the settings window hides it to the tray. `Open LogiPeek` or tray activation shows the same window again; Tray Exit performs clean shutdown.
 
 ## Compatibility and limits
@@ -73,7 +75,7 @@ cargo run -- --set-dpi 1600
 
 Run `cargo run` with no arguments to start the tray and settings window.
 
-The four presets, appearance choice, and GUI language are saved locally. DPI changes remain runtime-only device values and are not written to onboard profiles. CLI output remains English.
+The four presets, appearance choice, GUI language, startup intent, battery-alert preference, threshold, and optional opaque device selection are saved locally. DPI changes remain runtime-only device values and are not written to onboard profiles. CLI output remains English.
 
 The project uses `hidapi` with its `windows-native` backend. No runtime network access is required.
 
@@ -101,7 +103,7 @@ LogiPeek has no accounts, telemetry, analytics, uploads, cloud calls, runtime ne
 - Broaden validation beyond the observed Windows USB receiver setup to direct and Bluetooth devices.
 - Improve device/receiver interpretation only where protocol evidence supports it.
 - Add carefully validated reads for more battery formats and DPI data.
-- Broaden native-window accessibility and hardware coverage. Profiles, `0x2202` writes, RGB, macros, remapping, background services, startup registration, notifications, device selection, and updates remain outside the current phase.
+- Broaden native-window accessibility and multi-device hardware coverage. Profiles, `0x2202` writes, RGB, macros, remapping, background services, and automatic updates remain outside the current phase. LogiPeek performs no version polling; users obtain releases from this repository.
 
 ## Contributing
 

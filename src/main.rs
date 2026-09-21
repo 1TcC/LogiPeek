@@ -21,7 +21,7 @@ fn main() -> ExitCode {
     if args.is_empty() {
         #[cfg(windows)]
         {
-            return match tray::run() {
+            return match tray::run(false) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("Tray startup failed: {error}");
@@ -32,6 +32,22 @@ fn main() -> ExitCode {
         #[cfg(not(windows))]
         {
             eprintln!("Tray mode is available only on Windows.");
+            return ExitCode::FAILURE;
+        }
+    }
+    if args.as_slice() == ["--startup"] {
+        #[cfg(windows)]
+        {
+            return match tray::run(true) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Tray startup failed: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        #[cfg(not(windows))]
+        {
             return ExitCode::FAILURE;
         }
     }

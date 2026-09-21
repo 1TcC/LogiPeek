@@ -15,6 +15,7 @@ use crate::hid::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationStatus {
     Idle,
+    Loading,
     Applying(u16),
     Verified(u16),
     Failed(OperationError),
@@ -32,6 +33,7 @@ pub enum OperationError {
 pub enum SettingsNotice {
     Saved,
     SaveFailed,
+    StartupFailed,
     InvalidPreset,
 }
 
@@ -50,6 +52,13 @@ pub struct PresetState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceOption {
+    pub id: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppState {
     pub status: DeviceStatus,
     pub product: Option<String>,
@@ -61,6 +70,11 @@ pub struct AppState {
     pub presets: [u16; 4],
     pub theme: Theme,
     pub language: Option<Language>,
+    pub startup: bool,
+    pub battery_notifications: bool,
+    pub battery_threshold: u8,
+    pub devices: Vec<DeviceOption>,
+    pub selected_device: Option<String>,
     pub operation: OperationStatus,
     pub settings_notice: Option<SettingsNotice>,
     target: Option<TargetKey>,
@@ -68,14 +82,12 @@ pub struct AppState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetKey {
-    vid: u16,
-    pid: u16,
-    interface_number: i32,
-    device_index: u8,
+    id: String,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let settings = Settings::default();
         Self {
             status: DeviceStatus::Unavailable,
             product: None,
@@ -84,9 +96,14 @@ impl Default for AppState {
             charging: None,
             current_dpi: None,
             supported_dpi: None,
-            presets: Settings::default().presets,
+            presets: settings.presets,
             theme: Theme::System,
             language: None,
+            startup: settings.startup,
+            battery_notifications: settings.battery_notifications,
+            battery_threshold: settings.battery_threshold,
+            devices: Vec::new(),
+            selected_device: None,
             operation: OperationStatus::Idle,
             settings_notice: None,
             target: None,
@@ -101,23 +118,26 @@ impl AppState {
 
     pub fn from_scan_with_settings(interfaces: &[Interface], settings: &Settings) -> Self {
         let targets = targets(interfaces);
-        if targets.len() > 1 {
+        let selected_index = selected_target_index(&targets, settings.device.as_deref());
+        let devices = device_options(&targets, selected_index);
+        let Some(selected_index) = selected_index else {
             return Self {
-                status: DeviceStatus::MultipleDevices,
+                status: if targets.len() > 1 {
+                    DeviceStatus::MultipleDevices
+                } else {
+                    DeviceStatus::Unavailable
+                },
                 presets: settings.presets,
                 theme: settings.theme,
                 language: settings.language,
-                ..Self::default()
-            };
-        }
-        let Some((interface, endpoint)) = targets.first().copied() else {
-            return Self {
-                presets: settings.presets,
-                theme: settings.theme,
-                language: settings.language,
+                startup: settings.startup,
+                battery_notifications: settings.battery_notifications,
+                battery_threshold: settings.battery_threshold,
+                devices,
                 ..Self::default()
             };
         };
+        let (interface, endpoint) = targets[selected_index];
         let battery = endpoint
             .battery
             .as_ref()
@@ -138,6 +158,11 @@ impl AppState {
             presets: settings.presets,
             theme: settings.theme,
             language: settings.language,
+            startup: settings.startup,
+            battery_notifications: settings.battery_notifications,
+            battery_threshold: settings.battery_threshold,
+            devices,
+            selected_device: Some(endpoint.opaque_id.clone()),
             operation: OperationStatus::Idle,
             settings_notice: None,
             target: Some(TargetKey::new(interface, endpoint)),
@@ -157,6 +182,10 @@ impl AppState {
         self.presets = settings.presets;
         self.theme = settings.theme;
         self.language = settings.language;
+        self.startup = settings.startup;
+        self.battery_notifications = settings.battery_notifications;
+        self.battery_threshold = settings.battery_threshold;
+        self.selected_device = settings.device.clone();
     }
 
     pub fn settings(&self) -> Settings {
@@ -164,6 +193,10 @@ impl AppState {
             presets: self.presets,
             theme: self.theme,
             language: self.language,
+            startup: self.startup,
+            battery_notifications: self.battery_notifications,
+            battery_threshold: self.battery_threshold,
+            device: self.selected_device.clone(),
         }
     }
 
@@ -173,57 +206,17 @@ impl AppState {
         let settings = self.settings();
         let operation = self.operation.clone();
         let notice = self.settings_notice;
-        let targets = targets(interfaces);
-        if targets.len() > 1 {
-            *self = Self {
-                status: DeviceStatus::MultipleDevices,
-                presets: settings.presets,
-                theme: settings.theme,
-                language: settings.language,
-                operation,
-                settings_notice: notice,
-                ..Self::default()
-            };
-            return;
+        let previous_target = self.target.clone();
+        let previous_dpi = self.current_dpi;
+        let previous_supported = self.supported_dpi.clone();
+        let mut replacement = Self::from_scan_with_settings(interfaces, &settings);
+        if replacement.target == previous_target {
+            replacement.current_dpi = previous_dpi;
+            replacement.supported_dpi = previous_supported;
         }
-        let Some((interface, endpoint)) = targets.first().copied() else {
-            *self = Self {
-                presets: settings.presets,
-                theme: settings.theme,
-                language: settings.language,
-                operation,
-                settings_notice: notice,
-                ..Self::default()
-            };
-            return;
-        };
-        let key = TargetKey::new(interface, endpoint);
-        let battery = endpoint
-            .battery
-            .as_ref()
-            .and_then(|result| result.as_ref().ok());
-        if self.target.as_ref() != Some(&key) {
-            *self = Self {
-                status: DeviceStatus::Single,
-                product: Some(interface.product.clone()),
-                battery_percent: battery.and_then(|battery| battery.percentage),
-                battery_level: battery.and_then(|battery| battery.level.clone()),
-                charging: battery.map(|battery| battery.charging.clone()),
-                presets: settings.presets,
-                theme: settings.theme,
-                language: settings.language,
-                operation,
-                settings_notice: notice,
-                target: Some(key),
-                ..Self::default()
-            };
-            return;
-        }
-        self.status = DeviceStatus::Single;
-        self.product = Some(interface.product.clone());
-        self.battery_percent = battery.and_then(|battery| battery.percentage);
-        self.battery_level = battery.and_then(|battery| battery.level.clone());
-        self.charging = battery.map(|battery| battery.charging.clone());
+        replacement.operation = operation;
+        replacement.settings_notice = notice;
+        *self = replacement;
     }
 
     pub fn presets(&self) -> [PresetState; 4] {
@@ -236,6 +229,22 @@ impl AppState {
                     .is_some_and(|supported| dpi::supports_dpi(supported, value)),
             checked: self.status == DeviceStatus::Single && self.current_dpi == Some(value),
         })
+    }
+
+    pub fn begin_device_switch(&mut self, device: String) {
+        self.selected_device = Some(device.clone());
+        for option in &mut self.devices {
+            option.selected = option.id == device;
+        }
+        self.status = DeviceStatus::Unavailable;
+        self.product = None;
+        self.battery_percent = None;
+        self.battery_level = None;
+        self.charging = None;
+        self.current_dpi = None;
+        self.supported_dpi = None;
+        self.target = None;
+        self.operation = OperationStatus::Loading;
     }
 
     pub fn apply_dpi_outcome(&mut self, outcome: &SetDpiOutcome) {
@@ -349,6 +358,7 @@ impl AppState {
         let language = self.ui_language();
         match &self.operation {
             OperationStatus::Idle => String::new(),
+            OperationStatus::Loading => text(language, TextKey::Loading).into(),
             OperationStatus::Applying(value) => {
                 format!("{} {value} DPI...", text(language, TextKey::Applying))
             }
@@ -378,6 +388,7 @@ impl AppState {
         self.settings_notice.map(|notice| match notice {
             SettingsNotice::Saved => text(language, TextKey::SettingsSaved),
             SettingsNotice::SaveFailed => text(language, TextKey::SettingsSaveFailed),
+            SettingsNotice::StartupFailed => text(language, TextKey::StartupUpdateFailed),
             SettingsNotice::InvalidPreset => text(language, TextKey::InvalidPreset),
         })
     }
@@ -388,12 +399,9 @@ impl AppState {
 }
 
 impl TargetKey {
-    fn new(interface: &Interface, endpoint: &Endpoint) -> Self {
+    fn new(_interface: &Interface, endpoint: &Endpoint) -> Self {
         Self {
-            vid: interface.vid,
-            pid: interface.pid,
-            interface_number: interface.interface_number,
-            device_index: endpoint.index,
+            id: endpoint.opaque_id.clone(),
         }
     }
 }
@@ -412,7 +420,53 @@ fn targets(interfaces: &[Interface]) -> Vec<(&Interface, &Endpoint)> {
                 && endpoint
                     .features
                     .iter()
-                    .any(|feature| matches!(feature.result, Ok(Some(_))))
+                    .any(|feature| feature.id == 0x2201 && matches!(feature.result, Ok(Some(_))))
+        })
+        .collect()
+}
+
+fn selected_target_index(
+    targets: &[(&Interface, &Endpoint)],
+    remembered: Option<&str>,
+) -> Option<usize> {
+    if targets.len() == 1 {
+        return Some(0);
+    }
+    let remembered = remembered?;
+    let mut matches = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, endpoint))| endpoint.opaque_id == remembered);
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn device_options(
+    targets: &[(&Interface, &Endpoint)],
+    selected_index: Option<usize>,
+) -> Vec<DeviceOption> {
+    targets
+        .iter()
+        .enumerate()
+        .map(|(index, (interface, endpoint))| {
+            let duplicate_name = targets
+                .iter()
+                .filter(|(other, _)| other.product == interface.product)
+                .count()
+                > 1;
+            let label = if duplicate_name {
+                format!(
+                    "{} · Receiver {} · Slot {}",
+                    interface.product, interface.number, endpoint.index
+                )
+            } else {
+                interface.product.clone()
+            };
+            DeviceOption {
+                id: endpoint.opaque_id.clone(),
+                label,
+                selected: selected_index == Some(index),
+            }
         })
         .collect()
 }

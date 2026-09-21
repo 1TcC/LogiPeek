@@ -14,6 +14,7 @@ pub struct FeatureResult {
 #[derive(Debug)]
 pub struct Endpoint {
     pub index: u8,
+    pub opaque_id: String,
     pub protocol: Result<Protocol, Error>,
     pub features: Vec<FeatureResult>,
     pub battery: Option<Result<battery::Battery, Error>>,
@@ -60,6 +61,7 @@ pub struct DpiSetReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DpiTargetIdentity {
+    device_id: String,
     interface_number: usize,
     hid_interface_number: i32,
     vid: u16,
@@ -157,8 +159,8 @@ struct PreparedDpiTarget {
     sensor: dpi::SensorDpi,
 }
 
-fn unique_dpi_identity(interfaces: &[Interface]) -> Option<DpiTargetIdentity> {
-    let mut target = None;
+fn dpi_identities(interfaces: &[Interface]) -> Option<Vec<DpiTargetIdentity>> {
+    let mut targets = Vec::new();
 
     for interface in interfaces {
         for endpoint in &interface.endpoints {
@@ -175,10 +177,8 @@ fn unique_dpi_identity(interfaces: &[Interface]) -> Option<DpiTargetIdentity> {
                 Some(Ok(sensors)) if sensors.len() == 1 => sensors,
                 _ => return None,
             };
-            if target.is_some() {
-                return None;
-            }
-            target = Some(DpiTargetIdentity {
+            targets.push(DpiTargetIdentity {
+                device_id: endpoint.opaque_id.clone(),
                 interface_number: interface.number,
                 hid_interface_number: interface.interface_number,
                 vid: interface.vid,
@@ -192,8 +192,7 @@ fn unique_dpi_identity(interfaces: &[Interface]) -> Option<DpiTargetIdentity> {
             });
         }
     }
-
-    target
+    Some(targets)
 }
 
 fn info_matches_identity(info: &hidapi::DeviceInfo, identity: &DpiTargetIdentity) -> bool {
@@ -207,12 +206,24 @@ fn info_matches_identity(info: &hidapi::DeviceInfo, identity: &DpiTargetIdentity
 
 /// Creates an in-memory fast-path target only from a complete, unique DPI scan.
 /// The HID path is deliberately private and is never persisted or displayed.
-pub fn validated_dpi_target(interfaces: &[Interface]) -> Option<ValidatedDpiTarget> {
-    let identity = unique_dpi_identity(interfaces)?;
+pub fn validated_dpi_target(
+    interfaces: &[Interface],
+    selected_device: Option<&str>,
+) -> Option<ValidatedDpiTarget> {
+    let identity = select_dpi_identity(dpi_identities(interfaces)?, selected_device)?;
     let api = HidApi::new().ok()?;
-    let mut matches = api
-        .device_list()
-        .filter(|info| info_matches_identity(info, &identity));
+    let mut matches = api.device_list().filter(|info| {
+        info_matches_identity(info, &identity)
+            && opaque_device_id(
+                info.path().to_bytes(),
+                info.vendor_id(),
+                info.product_id(),
+                info.interface_number(),
+                info.usage_page(),
+                info.usage(),
+                identity.device_index,
+            ) == identity.device_id
+    });
     let info = matches.next()?;
     if matches.next().is_some() {
         return None;
@@ -221,6 +232,28 @@ pub fn validated_dpi_target(interfaces: &[Interface]) -> Option<ValidatedDpiTarg
         path: info.path().to_owned(),
         identity,
     })
+}
+
+fn select_dpi_identity(
+    mut identities: Vec<DpiTargetIdentity>,
+    selected_device: Option<&str>,
+) -> Option<DpiTargetIdentity> {
+    if identities.len() == 1 {
+        return Some(identities.remove(0));
+    }
+    let selected = selected_device?;
+    let index = identities
+        .iter()
+        .position(|identity| identity.device_id == selected)?;
+    if identities
+        .iter()
+        .filter(|identity| identity.device_id == selected)
+        .count()
+        != 1
+    {
+        return None;
+    }
+    Some(identities.remove(index))
 }
 
 /// A battery-only scan can preserve the target only when the unique 0x2201
@@ -244,22 +277,30 @@ pub fn validated_target_matches_scan(
                 Ok(None) => continue,
                 Err(_) => return false,
             };
-            if matched
-                || interface.interface_number != target.identity.hid_interface_number
-                || interface.vid != target.identity.vid
-                || interface.pid != target.identity.pid
-                || interface.usage_page != target.identity.usage_page
-                || interface.usage != target.identity.usage
-                || interface.product != target.identity.product
-                || endpoint.index != target.identity.device_index
-                || feature != target.identity.feature
-            {
-                return false;
+            if endpoint.opaque_id == target.identity.device_id {
+                if matched
+                    || interface.interface_number != target.identity.hid_interface_number
+                    || interface.vid != target.identity.vid
+                    || interface.pid != target.identity.pid
+                    || interface.usage_page != target.identity.usage_page
+                    || interface.usage != target.identity.usage
+                    || interface.product != target.identity.product
+                    || endpoint.index != target.identity.device_index
+                    || feature != target.identity.feature
+                {
+                    return false;
+                }
+                matched = true;
             }
-            matched = true;
         }
     }
     matched
+}
+
+impl ValidatedDpiTarget {
+    pub fn device_id(&self) -> &str {
+        &self.identity.device_id
+    }
 }
 
 fn revalidation_matches(
@@ -492,6 +533,15 @@ pub fn scan(options: ScanOptions) -> Result<Vec<Interface>, Error> {
                         let protocol = hidpp::probe(&mut transport, index);
                         let mut endpoint = Endpoint {
                             index,
+                            opaque_id: opaque_device_id(
+                                info.path().to_bytes(),
+                                info.vendor_id(),
+                                info.product_id(),
+                                info.interface_number(),
+                                info.usage_page(),
+                                info.usage(),
+                                index,
+                            ),
                             protocol,
                             features: Vec::new(),
                             battery: None,
@@ -551,6 +601,49 @@ pub fn scan(options: ScanOptions) -> Result<Vec<Interface>, Error> {
 /// HID metadata is untrusted; avoid control/terminal escape injection and huge output.
 pub fn safe_label(value: &str) -> String {
     value.chars().filter(|c| !c.is_control()).take(96).collect()
+}
+
+fn opaque_device_id(
+    path: &[u8],
+    vid: u16,
+    pid: u16,
+    interface_number: i32,
+    usage_page: u16,
+    usage: u16,
+    device_index: u8,
+) -> String {
+    fn hash(seed: u64, chunks: &[&[u8]]) -> u64 {
+        let mut value = seed;
+        for chunk in chunks {
+            for byte in *chunk {
+                value ^= u64::from(*byte);
+                value = value.wrapping_mul(0x100000001b3);
+            }
+            value ^= 0xff;
+            value = value.wrapping_mul(0x100000001b3);
+        }
+        value
+    }
+    let vid = vid.to_le_bytes();
+    let pid = pid.to_le_bytes();
+    let interface_number = interface_number.to_le_bytes();
+    let usage_page = usage_page.to_le_bytes();
+    let usage = usage.to_le_bytes();
+    let index = [device_index];
+    let chunks = [
+        path,
+        vid.as_slice(),
+        pid.as_slice(),
+        interface_number.as_slice(),
+        usage_page.as_slice(),
+        usage.as_slice(),
+        index.as_slice(),
+    ];
+    format!(
+        "{:016x}{:016x}",
+        hash(0xcbf29ce484222325, &chunks),
+        hash(0x84222325cbf29ce4, &chunks)
+    )
 }
 
 pub fn capability(endpoint: &Endpoint, ids: &[u16]) -> &'static str {
@@ -619,6 +712,7 @@ mod tests {
             open_error: None,
             endpoints: vec![Endpoint {
                 index: device_index,
+                opaque_id: format!("device-{device_index}"),
                 protocol: Ok(Protocol::Feature { major: 4, minor: 5 }),
                 features: vec![FeatureResult {
                     id: 0x2201,
@@ -631,21 +725,30 @@ mod tests {
     }
 
     fn identity() -> DpiTargetIdentity {
-        unique_dpi_identity(&[interface(1, Ok(Some(dpi_feature())))]).expect("one valid target")
+        dpi_identities(&[interface(1, Ok(Some(dpi_feature())))])
+            .expect("valid topology")
+            .remove(0)
     }
 
     #[test]
     fn full_scan_requires_exactly_one_complete_dpi_target() {
-        assert!(unique_dpi_identity(&[]).is_none());
-        assert!(unique_dpi_identity(&[interface(1, Ok(Some(dpi_feature())))]).is_some());
-        assert!(
-            unique_dpi_identity(&[
+        assert_eq!(dpi_identities(&[]), Some(Vec::new()));
+        assert_eq!(
+            dpi_identities(&[interface(1, Ok(Some(dpi_feature())))])
+                .expect("valid topology")
+                .len(),
+            1
+        );
+        assert_eq!(
+            dpi_identities(&[
                 interface(1, Ok(Some(dpi_feature()))),
                 interface(2, Ok(Some(dpi_feature()))),
             ])
-            .is_none()
+            .expect("valid topology")
+            .len(),
+            2
         );
-        assert!(unique_dpi_identity(&[interface(1, Err(Error::Timeout))]).is_none());
+        assert!(dpi_identities(&[interface(1, Err(Error::Timeout))]).is_none());
     }
 
     #[test]
@@ -717,5 +820,37 @@ mod tests {
         let identity = identity();
         assert!(dpi::supports_dpi(&identity.sensor.supported, 1350));
         assert!(!dpi::supports_dpi(&identity.sensor.supported, 1325));
+    }
+
+    #[test]
+    fn opaque_identity_is_stable_and_separates_slots() {
+        let first = opaque_device_id(b"path", 0x046d, 0xc547, 2, 0xff00, 2, 1);
+        assert_eq!(first.len(), 32);
+        assert_eq!(
+            first,
+            opaque_device_id(b"path", 0x046d, 0xc547, 2, 0xff00, 2, 1)
+        );
+        assert_ne!(
+            first,
+            opaque_device_id(b"path", 0x046d, 0xc547, 2, 0xff00, 2, 2)
+        );
+        assert_ne!(
+            first,
+            opaque_device_id(b"other", 0x046d, 0xc547, 2, 0xff00, 2, 1)
+        );
+    }
+
+    #[test]
+    fn multiple_targets_require_one_explicit_matching_identity() {
+        let identities = dpi_identities(&[
+            interface(1, Ok(Some(dpi_feature()))),
+            interface(2, Ok(Some(dpi_feature()))),
+        ])
+        .expect("valid topology");
+        assert!(select_dpi_identity(identities.clone(), None).is_none());
+        assert!(select_dpi_identity(identities.clone(), Some("missing")).is_none());
+        let selected =
+            select_dpi_identity(identities, Some("device-2")).expect("explicit unique selection");
+        assert_eq!(selected.device_id, "device-2");
     }
 }

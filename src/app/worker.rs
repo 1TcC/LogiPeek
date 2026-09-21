@@ -8,9 +8,10 @@ use std::{
 
 pub const BATTERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     RefreshAll,
+    SelectDevice(String),
     SetDpi(u16),
     Shutdown,
 }
@@ -65,18 +66,21 @@ impl Worker {
 }
 
 fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: impl Fn()) {
-    let mut dpi_target = refresh_all(&state);
+    let mut dpi_target = refresh_all(&state, None);
     notify();
     loop {
         match receiver.recv_timeout(BATTERY_REFRESH_INTERVAL) {
-            Ok(Command::RefreshAll) => dpi_target = refresh_all(&state),
+            Ok(Command::RefreshAll) => dpi_target = refresh_all(&state, None),
+            Ok(Command::SelectDevice(device)) => {
+                dpi_target = refresh_all(&state, Some(&device));
+            }
             Ok(Command::SetDpi(value)) => {
                 let status = state
                     .lock()
                     .map_or(DeviceStatus::Unavailable, |current| current.status);
                 match dpi_write_route(status, dpi_target.is_some()) {
                     DpiWriteRoute::Fast => {}
-                    DpiWriteRoute::FullPreflight => dpi_target = refresh_all(&state),
+                    DpiWriteRoute::FullPreflight => dpi_target = refresh_all(&state, None),
                     DpiWriteRoute::Blocked => dpi_target = None,
                 }
                 let result = dpi_target
@@ -111,16 +115,18 @@ fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: i
     }
 }
 
-fn refresh_all(state: &Mutex<AppState>) -> Option<device::ValidatedDpiTarget> {
+fn refresh_all(
+    state: &Mutex<AppState>,
+    selected_device: Option<&str>,
+) -> Option<device::ValidatedDpiTarget> {
     let result = device::scan(ScanOptions {
         read_battery: true,
         read_dpi: true,
     });
-    let target = result
-        .as_ref()
-        .ok()
-        .and_then(|interfaces| device::validated_dpi_target(interfaces));
     if let Ok(mut current) = state.lock() {
+        if let Some(selected_device) = selected_device {
+            current.begin_device_switch(selected_device.to_owned());
+        }
         match &result {
             Ok(interfaces) => current.replace_from_scan(interfaces),
             Err(_) => {
@@ -130,7 +136,18 @@ fn refresh_all(state: &Mutex<AppState>) -> Option<device::ValidatedDpiTarget> {
                 *current = replacement;
             }
         }
+        if selected_device.is_some() {
+            current.operation = OperationStatus::Idle;
+        }
     }
+    let selected = state
+        .lock()
+        .ok()
+        .and_then(|current| current.selected_device.clone());
+    let target = result
+        .as_ref()
+        .ok()
+        .and_then(|interfaces| device::validated_dpi_target(interfaces, selected.as_deref()));
     target.filter(|_| {
         state
             .lock()

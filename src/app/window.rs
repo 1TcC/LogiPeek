@@ -15,7 +15,7 @@ use std::{
     sync::Mutex,
 };
 use windows_sys::Win32::{
-    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM},
+    Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
     Graphics::{
         Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
         Gdi::{
@@ -33,28 +33,30 @@ use windows_sys::Win32::{
             VK_F5, VK_RETURN, VK_TAB,
         },
         WindowsAndMessaging::{
-            CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            GWLP_USERDATA, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, HICON, ICON_BIG,
-            ICON_SMALL, IDC_ARROW, IDC_HAND, LoadCursorW, RegisterClassExW, SM_CXSCREEN,
-            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageW, SetCursor,
-            SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, UnregisterClassW,
-            WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DPICHANGED,
-            WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
-            WM_NCDESTROY, WM_PAINT, WM_SETICON, WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSCOLORCHANGE,
-            WM_THEMECHANGED, WNDCLASSEXW, WS_CAPTION, WS_EX_APPWINDOW, WS_MINIMIZEBOX,
-            WS_OVERLAPPED, WS_SYSMENU,
+            AppendMenuW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW,
+            DefWindowProcW, DestroyMenu, DestroyWindow, GWLP_USERDATA, GetClientRect, GetCursorPos,
+            GetSystemMetrics, GetWindowLongPtrW, HICON, ICON_BIG, ICON_SMALL, IDC_ARROW, IDC_HAND,
+            LoadCursorW, MF_CHECKED, MF_STRING, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN,
+            SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageW, SetCursor, SetForegroundWindow,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+            TrackPopupMenu, UnregisterClassW, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
+            WM_COMMAND, WM_CREATE, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETICON,
+            WM_SETTINGCHANGE, WM_SHOWWINDOW, WM_SYSCOLORCHANGE, WM_THEMECHANGED, WNDCLASSEXW,
+            WS_CAPTION, WS_EX_APPWINDOW, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
         },
     },
 };
 
 const CLASS_NAME: &str = "LogiPeek.Settings.Window";
 const CLIENT_WIDTH: i32 = 400;
-const CLIENT_HEIGHT: i32 = 580;
+const CLIENT_HEIGHT: i32 = 640;
 const WM_REDRAW: u32 = WM_APP + 10;
 const WM_MOUSELEAVE: u32 = 0x02a3;
 const REFRESH_RECT: (i32, i32, i32, i32) = (344, 18, 36, 36);
 const SLIDER_RECT: (i32, i32, i32, i32) = (28, 276, 344, 42);
 const SAVE_RECT: (i32, i32, i32, i32) = (286, 388, 78, 28);
+const DEVICE_RECT: (i32, i32, i32, i32) = (20, 42, 300, 30);
 
 pub(crate) struct MainWindow {
     hwnd: HWND,
@@ -79,12 +81,16 @@ struct WindowState {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HitTarget {
+    Device,
     Refresh,
     Slider,
     Preset(usize),
     Edit(usize),
     Theme(usize),
     Language(usize),
+    Startup(bool),
+    BatteryNotifications(bool),
+    Threshold(i8),
     Save,
 }
 
@@ -518,6 +524,7 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
 fn handle_target(state: &WindowState, target: HitTarget) {
     let snapshot = app(state).snapshot();
     match target {
+        HitTarget::Device => show_device_menu(state, &snapshot),
         HitTarget::Refresh => app(state).refresh(),
         HitTarget::Edit(index) => {
             state.editing.set(Some(index));
@@ -543,6 +550,13 @@ fn handle_target(state: &WindowState, target: HitTarget) {
             let language = [Language::English, Language::SimplifiedChinese][index];
             app(state).set_language(language);
         }
+        HitTarget::Startup(enabled) => app(state).set_startup(enabled),
+        HitTarget::BatteryNotifications(enabled) => app(state).set_battery_notifications(enabled),
+        HitTarget::Threshold(delta) => {
+            let threshold =
+                (i16::from(snapshot.battery_threshold) + i16::from(delta) * 5).clamp(5, 50) as u8;
+            app(state).set_battery_threshold(threshold);
+        }
         HitTarget::Save => save_from_controls(state),
         HitTarget::Slider => {}
     }
@@ -561,6 +575,10 @@ fn hit_target(state: &WindowState, x: i32, y: i32) -> Option<HitTarget> {
     }
     if contains(REFRESH_RECT, logical) {
         return Some(HitTarget::Refresh);
+    }
+    let snapshot = app(state).snapshot();
+    if snapshot.devices.len() > 1 && contains(DEVICE_RECT, logical) {
+        return Some(HitTarget::Device);
     }
     if contains(SLIDER_RECT, logical) {
         return Some(HitTarget::Slider);
@@ -583,7 +601,60 @@ fn hit_target(state: &WindowState, x: i32, y: i32) -> Option<HitTarget> {
             return Some(HitTarget::Language(index));
         }
     }
+    for index in 0..2 {
+        if contains(startup_rect(index), logical) {
+            return Some(HitTarget::Startup(index == 0));
+        }
+        if contains(notification_rect(index), logical) {
+            return Some(HitTarget::BatteryNotifications(index == 0));
+        }
+    }
+    for (index, delta) in [-1, 1].into_iter().enumerate() {
+        if contains(threshold_rect(index), logical) {
+            return Some(HitTarget::Threshold(delta));
+        }
+    }
     contains(SAVE_RECT, logical).then_some(HitTarget::Save)
+}
+
+fn show_device_menu(state: &WindowState, snapshot: &logipeek::app::state::AppState) {
+    let menu = unsafe { CreatePopupMenu() };
+    if menu.is_null() {
+        return;
+    }
+    for (index, device) in snapshot.devices.iter().enumerate() {
+        let label = wide(&device.label);
+        let flags = MF_STRING | if device.selected { MF_CHECKED } else { 0 };
+        unsafe {
+            // SAFETY: menu is live and label is terminated for the duration of AppendMenuW.
+            AppendMenuW(menu, flags, 1_000 + index, label.as_ptr());
+        }
+    }
+    let mut point = POINT::default();
+    let command = unsafe {
+        // SAFETY: The popup is owned by this UI thread and used synchronously.
+        GetCursorPos(&mut point);
+        SetForegroundWindow(state.hwnd.get());
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x,
+            point.y,
+            0,
+            state.hwnd.get(),
+            null(),
+        ) as usize
+    };
+    unsafe {
+        // SAFETY: TrackPopupMenu returned and menu is no longer in use.
+        DestroyMenu(menu);
+    }
+    if command >= 1_000 {
+        let index = command - 1_000;
+        if let Some(device) = snapshot.devices.get(index) {
+            app(state).select_device(device.id.clone());
+        }
+    }
 }
 
 fn update_hover(state: &WindowState, point: (i32, i32)) {
@@ -686,6 +757,10 @@ fn save_from_controls(state: &WindowState) {
         presets,
         theme: state.pending_theme.get(),
         language: snapshot.language,
+        startup: snapshot.startup,
+        battery_notifications: snapshot.battery_notifications,
+        battery_threshold: snapshot.battery_threshold,
+        device: snapshot.selected_device,
     });
 }
 
@@ -809,14 +884,39 @@ fn paint_client(state: &WindowState, dc: HDC, client: RECT) {
         },
     );
 
-    draw_text(
-        dc,
-        body,
-        palette.text,
-        scale(20, dpi),
-        scale(48, dpi),
-        "Logitech Mouse",
-    );
+    let device_label = snapshot
+        .devices
+        .iter()
+        .find(|device| device.selected)
+        .map(|device| device.label.as_str())
+        .or(snapshot.product.as_deref())
+        .unwrap_or_else(|| text(language, TextKey::Device));
+    if snapshot.devices.len() > 1 {
+        let label = format!("{device_label}  ▾");
+        draw_button(
+            dc,
+            body,
+            palette,
+            dpi,
+            Button {
+                rect: DEVICE_RECT,
+                label: &label,
+                enabled: true,
+                selected: snapshot.selected_device.is_some(),
+                hovered: state.hover.get() == Some(HitTarget::Device),
+                pressed: state.pressed.get() == Some(HitTarget::Device),
+            },
+        );
+    } else {
+        draw_text(
+            dc,
+            body,
+            palette.text,
+            scale(20, dpi),
+            scale(48, dpi),
+            device_label,
+        );
+    }
     let status_color = match snapshot.status {
         DeviceStatus::Single => palette.status_ok,
         DeviceStatus::Unavailable | DeviceStatus::MultipleDevices => palette.status_warn,
@@ -927,7 +1027,7 @@ fn paint_client(state: &WindowState, dc: HDC, client: RECT) {
         );
     }
 
-    draw_card(dc, palette, dpi, (20, 380, 360, 178));
+    draw_card(dc, palette, dpi, (20, 380, 360, 240));
     draw_text(
         dc,
         heading,
@@ -1024,6 +1124,96 @@ fn paint_client(state: &WindowState, dc: HDC, client: RECT) {
             },
         );
     }
+    draw_text(
+        dc,
+        secondary,
+        palette.text,
+        scale(36, dpi),
+        scale(538, dpi),
+        text(language, TextKey::StartWithWindows),
+    );
+    for (index, (enabled, key)) in [(true, TextKey::On), (false, TextKey::Off)]
+        .into_iter()
+        .enumerate()
+    {
+        let target = HitTarget::Startup(enabled);
+        draw_button(
+            dc,
+            secondary,
+            palette,
+            dpi,
+            Button {
+                rect: startup_rect(index),
+                label: text(language, key),
+                enabled: true,
+                selected: snapshot.startup == enabled,
+                hovered: state.hover.get() == Some(target),
+                pressed: state.pressed.get() == Some(target),
+            },
+        );
+    }
+    draw_text(
+        dc,
+        secondary,
+        palette.text,
+        scale(36, dpi),
+        scale(568, dpi),
+        text(language, TextKey::LowBatteryNotifications),
+    );
+    for (index, (enabled, key)) in [(true, TextKey::On), (false, TextKey::Off)]
+        .into_iter()
+        .enumerate()
+    {
+        let target = HitTarget::BatteryNotifications(enabled);
+        draw_button(
+            dc,
+            secondary,
+            palette,
+            dpi,
+            Button {
+                rect: notification_rect(index),
+                label: text(language, key),
+                enabled: true,
+                selected: snapshot.battery_notifications == enabled,
+                hovered: state.hover.get() == Some(target),
+                pressed: state.pressed.get() == Some(target),
+            },
+        );
+    }
+    draw_text(
+        dc,
+        secondary,
+        palette.text,
+        scale(36, dpi),
+        scale(598, dpi),
+        text(language, TextKey::NotifyBelow),
+    );
+    let threshold = format!("{}%", snapshot.battery_threshold);
+    draw_text_center(
+        dc,
+        secondary,
+        palette.text,
+        dpi_rect((279, 594, 42, 24), dpi),
+        &threshold,
+    );
+    for (index, label) in ["−", "+"].into_iter().enumerate() {
+        let target = HitTarget::Threshold(if index == 0 { -1 } else { 1 });
+        draw_button(
+            dc,
+            secondary,
+            palette,
+            dpi,
+            Button {
+                rect: threshold_rect(index),
+                label,
+                enabled: (index == 0 && snapshot.battery_threshold > 5)
+                    || (index == 1 && snapshot.battery_threshold < 50),
+                selected: false,
+                hovered: state.hover.get() == Some(target),
+                pressed: state.pressed.get() == Some(target),
+            },
+        );
+    }
     draw_button(
         dc,
         body,
@@ -1044,7 +1234,7 @@ fn paint_client(state: &WindowState, dc: HDC, client: RECT) {
             secondary,
             palette.secondary,
             scale(22, dpi),
-            scale(562, dpi),
+            scale(623, dpi),
             notice,
         );
     }
@@ -1521,6 +1711,18 @@ fn language_rect(index: usize) -> (i32, i32, i32, i32) {
     (112 + index as i32 * 122, 498, 120, 28)
 }
 
+fn startup_rect(index: usize) -> (i32, i32, i32, i32) {
+    (260 + index as i32 * 53, 532, 50, 26)
+}
+
+fn notification_rect(index: usize) -> (i32, i32, i32, i32) {
+    (260 + index as i32 * 53, 562, 50, 26)
+}
+
+fn threshold_rect(index: usize) -> (i32, i32, i32, i32) {
+    (242 + index as i32 * 83, 594, 34, 24)
+}
+
 fn picker_language_rect(index: usize) -> (i32, i32, i32, i32) {
     (78, 300 + index as i32 * 54, 244, 38)
 }
@@ -1677,10 +1879,17 @@ mod tests {
 
     #[test]
     fn compact_controls_fit_at_supported_test_dpis() {
-        let mut rects = vec![REFRESH_RECT, SLIDER_RECT, SAVE_RECT];
+        let mut rects = vec![REFRESH_RECT, SLIDER_RECT, SAVE_RECT, DEVICE_RECT];
         rects.extend((0..4).flat_map(|index| [preset_rect(index), edit_rect(index)]));
         rects.extend((0..3).map(theme_rect));
         rects.extend((0..2).flat_map(|index| [language_rect(index), picker_language_rect(index)]));
+        rects.extend((0..2).flat_map(|index| {
+            [
+                startup_rect(index),
+                notification_rect(index),
+                threshold_rect(index),
+            ]
+        }));
 
         for dpi in [96, 120, 192] {
             for rect in &rects {
@@ -1696,7 +1905,7 @@ mod tests {
     fn compact_sections_do_not_overlap() {
         let battery = (20, 92, 360, 84);
         let dpi = (20, 188, 360, 180);
-        let settings = (20, 380, 360, 178);
+        let settings = (20, 380, 360, 240);
         assert!(battery.1 + battery.3 < dpi.1);
         assert!(dpi.1 + dpi.3 < settings.1);
         assert!(settings.1 + settings.3 <= CLIENT_HEIGHT);
