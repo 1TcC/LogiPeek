@@ -4,7 +4,7 @@ use super::{
     transport::Transport,
 };
 use hidapi::HidApi;
-use std::fmt;
+use std::{ffi::CString, fmt};
 
 #[derive(Debug)]
 pub struct FeatureResult {
@@ -56,6 +56,38 @@ pub struct DpiSetReport {
     pub previous: u16,
     pub requested: u16,
     pub outcome: dpi::SetDpiOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DpiTargetIdentity {
+    interface_number: usize,
+    hid_interface_number: i32,
+    vid: u16,
+    pid: u16,
+    usage_page: u16,
+    usage: u16,
+    product: String,
+    device_index: u8,
+    feature: Feature,
+    sensor: dpi::SensorDpi,
+}
+
+#[derive(Clone)]
+pub struct ValidatedDpiTarget {
+    path: CString,
+    identity: DpiTargetIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastDpiError {
+    Unsupported,
+    Invalidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastDpiSetResult {
+    pub report: DpiSetReport,
+    pub target_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +155,198 @@ struct PreparedDpiTarget {
     device_index: u8,
     feature: Feature,
     sensor: dpi::SensorDpi,
+}
+
+fn unique_dpi_identity(interfaces: &[Interface]) -> Option<DpiTargetIdentity> {
+    let mut target = None;
+
+    for interface in interfaces {
+        for endpoint in &interface.endpoints {
+            if !matches!(endpoint.protocol, Ok(Protocol::Feature { .. })) {
+                continue;
+            }
+            let feature_result = endpoint.features.iter().find(|item| item.id == 0x2201)?;
+            let feature = match &feature_result.result {
+                Ok(Some(feature)) => *feature,
+                Ok(None) => continue,
+                Err(_) => return None,
+            };
+            let sensors = match &endpoint.dpi {
+                Some(Ok(sensors)) if sensors.len() == 1 => sensors,
+                _ => return None,
+            };
+            if target.is_some() {
+                return None;
+            }
+            target = Some(DpiTargetIdentity {
+                interface_number: interface.number,
+                hid_interface_number: interface.interface_number,
+                vid: interface.vid,
+                pid: interface.pid,
+                usage_page: interface.usage_page,
+                usage: interface.usage,
+                product: interface.product.clone(),
+                device_index: endpoint.index,
+                feature,
+                sensor: sensors[0].clone(),
+            });
+        }
+    }
+
+    target
+}
+
+fn info_matches_identity(info: &hidapi::DeviceInfo, identity: &DpiTargetIdentity) -> bool {
+    info.vendor_id() == identity.vid
+        && info.product_id() == identity.pid
+        && info.interface_number() == identity.hid_interface_number
+        && info.usage_page() == identity.usage_page
+        && info.usage() == identity.usage
+        && safe_label(info.product_string().unwrap_or("Unavailable")) == identity.product
+}
+
+/// Creates an in-memory fast-path target only from a complete, unique DPI scan.
+/// The HID path is deliberately private and is never persisted or displayed.
+pub fn validated_dpi_target(interfaces: &[Interface]) -> Option<ValidatedDpiTarget> {
+    let identity = unique_dpi_identity(interfaces)?;
+    let api = HidApi::new().ok()?;
+    let mut matches = api
+        .device_list()
+        .filter(|info| info_matches_identity(info, &identity));
+    let info = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(ValidatedDpiTarget {
+        path: info.path().to_owned(),
+        identity,
+    })
+}
+
+/// A battery-only scan can preserve the target only when the unique 0x2201
+/// endpoint still has the same public HID and HID++ identity.
+pub fn validated_target_matches_scan(
+    target: &ValidatedDpiTarget,
+    interfaces: &[Interface],
+) -> bool {
+    let mut matched = false;
+    for interface in interfaces {
+        for endpoint in &interface.endpoints {
+            if !matches!(endpoint.protocol, Ok(Protocol::Feature { .. })) {
+                continue;
+            }
+            let Some(feature_result) = endpoint.features.iter().find(|item| item.id == 0x2201)
+            else {
+                return false;
+            };
+            let feature = match &feature_result.result {
+                Ok(Some(feature)) => *feature,
+                Ok(None) => continue,
+                Err(_) => return false,
+            };
+            if matched
+                || interface.interface_number != target.identity.hid_interface_number
+                || interface.vid != target.identity.vid
+                || interface.pid != target.identity.pid
+                || interface.usage_page != target.identity.usage_page
+                || interface.usage != target.identity.usage
+                || interface.product != target.identity.product
+                || endpoint.index != target.identity.device_index
+                || feature != target.identity.feature
+            {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn revalidation_matches(
+    identity: &DpiTargetIdentity,
+    feature: Feature,
+    sensors: &[dpi::SensorDpi],
+) -> bool {
+    feature == identity.feature
+        && sensors.len() == 1
+        && sensors[0].sensor == identity.sensor.sensor
+        && sensors[0].supported == identity.sensor.supported
+}
+
+fn outcome_keeps_target(outcome: &dpi::SetDpiOutcome) -> bool {
+    matches!(
+        outcome,
+        dpi::SetDpiOutcome::Verified { .. } | dpi::SetDpiOutcome::TimedOutConfirmed { .. }
+    )
+}
+
+/// Reopens and revalidates one previously unique target. Every identity and
+/// capability check occurs before the single possible fn3 request.
+pub fn set_validated_runtime_dpi(
+    target: &mut ValidatedDpiTarget,
+    requested: u16,
+) -> Result<FastDpiSetResult, FastDpiError> {
+    if !dpi::supports_dpi(&target.identity.sensor.supported, requested) {
+        return Err(FastDpiError::Unsupported);
+    }
+
+    let api = HidApi::new().map_err(|_| FastDpiError::Invalidated)?;
+    let mut matches = api.device_list().filter(|info| {
+        info.path() == target.path.as_c_str() && info_matches_identity(info, &target.identity)
+    });
+    let info = matches.next().ok_or(FastDpiError::Invalidated)?;
+    if matches.next().is_some() {
+        return Err(FastDpiError::Invalidated);
+    }
+    let handle = info
+        .open_device(&api)
+        .map_err(|_| FastDpiError::Invalidated)?;
+    let mut transport = Transport::new(handle, info.usage() == 2);
+    if !matches!(
+        hidpp::probe(&mut transport, target.identity.device_index),
+        Ok(Protocol::Feature { .. })
+    ) {
+        return Err(FastDpiError::Invalidated);
+    }
+    let feature = hidpp::discover(&mut transport, target.identity.device_index, 0x2201)
+        .map_err(|_| FastDpiError::Invalidated)?
+        .ok_or(FastDpiError::Invalidated)?;
+    let sensors = dpi::read(&mut transport, target.identity.device_index, feature)
+        .map_err(|_| FastDpiError::Invalidated)?;
+    if !revalidation_matches(&target.identity, feature, &sensors) {
+        return Err(FastDpiError::Invalidated);
+    }
+
+    let previous = sensors[0].current;
+    let outcome = dpi::set_and_verify(
+        &mut transport,
+        target.identity.device_index,
+        feature,
+        1,
+        &sensors[0],
+        requested,
+    )
+    .map_err(|_| FastDpiError::Invalidated)?;
+    let target_valid = outcome_keeps_target(&outcome);
+    if let dpi::SetDpiOutcome::Verified { current }
+    | dpi::SetDpiOutcome::TimedOutConfirmed { current } = &outcome
+    {
+        target.identity.sensor.current = *current;
+    }
+    Ok(FastDpiSetResult {
+        report: DpiSetReport {
+            interface_number: target.identity.interface_number,
+            vid: target.identity.vid,
+            pid: target.identity.pid,
+            product: target.identity.product.clone(),
+            device_index: target.identity.device_index,
+            feature_version: feature.version,
+            previous,
+            requested,
+            outcome,
+        },
+        target_valid,
+    })
 }
 
 /// Performs a fresh capability preflight across all candidates and sends a
@@ -347,4 +571,151 @@ pub fn capability(endpoint: &Endpoint, ids: &[u16]) -> &'static str {
         return "Unsupported (queried features)";
     }
     "Unknown"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dpi_feature() -> Feature {
+        Feature {
+            id: 0x2201,
+            index: 9,
+            flags: 0,
+            version: 2,
+        }
+    }
+
+    fn sensor() -> dpi::SensorDpi {
+        dpi::SensorDpi {
+            sensor: 0,
+            current: 1300,
+            default: Some(800),
+            supported: dpi::DpiValues::Range {
+                minimum: 100,
+                maximum: 25_600,
+                step: 50,
+            },
+        }
+    }
+
+    fn interface(device_index: u8, feature: Result<Option<Feature>, Error>) -> Interface {
+        let dpi = feature
+            .as_ref()
+            .ok()
+            .and_then(|value| *value)
+            .map(|_| Ok(vec![sensor()]));
+        Interface {
+            number: 1,
+            vid: 0x046d,
+            pid: 0xc547,
+            product: "Test Mouse".into(),
+            manufacturer: "Logitech".into(),
+            interface_number: 2,
+            usage_page: 0xff00,
+            usage: 2,
+            candidate: true,
+            descriptor_bytes: Some(64),
+            open_error: None,
+            endpoints: vec![Endpoint {
+                index: device_index,
+                protocol: Ok(Protocol::Feature { major: 4, minor: 5 }),
+                features: vec![FeatureResult {
+                    id: 0x2201,
+                    result: feature,
+                }],
+                battery: None,
+                dpi,
+            }],
+        }
+    }
+
+    fn identity() -> DpiTargetIdentity {
+        unique_dpi_identity(&[interface(1, Ok(Some(dpi_feature())))]).expect("one valid target")
+    }
+
+    #[test]
+    fn full_scan_requires_exactly_one_complete_dpi_target() {
+        assert!(unique_dpi_identity(&[]).is_none());
+        assert!(unique_dpi_identity(&[interface(1, Ok(Some(dpi_feature())))]).is_some());
+        assert!(
+            unique_dpi_identity(&[
+                interface(1, Ok(Some(dpi_feature()))),
+                interface(2, Ok(Some(dpi_feature()))),
+            ])
+            .is_none()
+        );
+        assert!(unique_dpi_identity(&[interface(1, Err(Error::Timeout))]).is_none());
+    }
+
+    #[test]
+    fn identity_or_capability_change_fails_before_write() {
+        let identity = identity();
+        let mut wrong_feature = dpi_feature();
+        wrong_feature.version += 1;
+        assert!(!revalidation_matches(&identity, wrong_feature, &[sensor()]));
+
+        let mut changed_sensor = sensor();
+        changed_sensor.supported = dpi::DpiValues::List(vec![400, 800, 1600]);
+        assert!(!revalidation_matches(
+            &identity,
+            dpi_feature(),
+            &[changed_sensor]
+        ));
+        assert!(revalidation_matches(&identity, dpi_feature(), &[sensor()]));
+    }
+
+    #[test]
+    fn topology_mismatch_invalidates_cached_target() {
+        let identity = identity();
+        let target = ValidatedDpiTarget {
+            path: CString::new("test").unwrap(),
+            identity,
+        };
+        assert!(validated_target_matches_scan(
+            &target,
+            &[interface(1, Ok(Some(dpi_feature())))]
+        ));
+        assert!(!validated_target_matches_scan(
+            &target,
+            &[interface(2, Ok(Some(dpi_feature())))]
+        ));
+        assert!(!validated_target_matches_scan(
+            &target,
+            &[interface(1, Err(Error::Timeout))]
+        ));
+    }
+
+    #[test]
+    fn only_independently_confirmed_outcomes_keep_target() {
+        assert!(outcome_keeps_target(&dpi::SetDpiOutcome::Verified {
+            current: 1350
+        }));
+        assert!(outcome_keeps_target(
+            &dpi::SetDpiOutcome::TimedOutConfirmed { current: 1350 }
+        ));
+        assert!(!outcome_keeps_target(
+            &dpi::SetDpiOutcome::AcknowledgedMismatch { actual: 1300 }
+        ));
+        assert!(!outcome_keeps_target(
+            &dpi::SetDpiOutcome::TimedOutDifferent { actual: 1300 }
+        ));
+        assert!(!outcome_keeps_target(
+            &dpi::SetDpiOutcome::AcknowledgedUnverified {
+                error: Error::Timeout
+            }
+        ));
+        assert!(!outcome_keeps_target(
+            &dpi::SetDpiOutcome::TimedOutUnverified {
+                error: Error::Timeout
+            }
+        ));
+    }
+
+    #[test]
+    fn cached_capability_rejects_unsupported_dpi() {
+        let identity = identity();
+        assert!(dpi::supports_dpi(&identity.sensor.supported, 1350));
+        assert!(!dpi::supports_dpi(&identity.sensor.supported, 1325));
+    }
 }

@@ -1,4 +1,4 @@
-use super::state::{AppState, OperationError, OperationStatus};
+use super::state::{AppState, DeviceStatus, OperationError, OperationStatus};
 use crate::hid::device::{self, ScanOptions};
 use std::{
     sync::{Arc, Mutex, mpsc},
@@ -13,6 +13,21 @@ pub enum Command {
     RefreshAll,
     SetDpi(u16),
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiWriteRoute {
+    Fast,
+    FullPreflight,
+    Blocked,
+}
+
+fn dpi_write_route(status: DeviceStatus, has_target: bool) -> DpiWriteRoute {
+    match (status, has_target) {
+        (DeviceStatus::MultipleDevices, _) => DpiWriteRoute::Blocked,
+        (DeviceStatus::Single, true) => DpiWriteRoute::Fast,
+        _ => DpiWriteRoute::FullPreflight,
+    }
 }
 
 pub struct Worker {
@@ -50,37 +65,64 @@ impl Worker {
 }
 
 fn run(receiver: mpsc::Receiver<Command>, state: Arc<Mutex<AppState>>, notify: impl Fn()) {
-    refresh_all(&state);
+    let mut dpi_target = refresh_all(&state);
     notify();
     loop {
         match receiver.recv_timeout(BATTERY_REFRESH_INTERVAL) {
-            Ok(Command::RefreshAll) => refresh_all(&state),
+            Ok(Command::RefreshAll) => dpi_target = refresh_all(&state),
             Ok(Command::SetDpi(value)) => {
-                let result = device::set_unique_runtime_dpi(value);
+                let status = state
+                    .lock()
+                    .map_or(DeviceStatus::Unavailable, |current| current.status);
+                match dpi_write_route(status, dpi_target.is_some()) {
+                    DpiWriteRoute::Fast => {}
+                    DpiWriteRoute::FullPreflight => dpi_target = refresh_all(&state),
+                    DpiWriteRoute::Blocked => dpi_target = None,
+                }
+                let result = dpi_target
+                    .as_mut()
+                    .map(|target| device::set_validated_runtime_dpi(target, value));
                 if let Ok(mut current) = state.lock() {
                     match result {
-                        Ok(report) => current.apply_dpi_outcome(&report.outcome),
-                        Err(_) => {
+                        Some(Ok(result)) => {
+                            current.apply_dpi_outcome(&result.report.outcome);
+                            if !result.target_valid {
+                                dpi_target = None;
+                            }
+                        }
+                        Some(Err(device::FastDpiError::Unsupported)) => {
+                            current.operation = OperationStatus::Failed(OperationError::Failed)
+                        }
+                        Some(Err(device::FastDpiError::Invalidated)) | None => {
+                            dpi_target = None;
                             current.operation = OperationStatus::Failed(OperationError::Failed)
                         }
                     }
                 }
             }
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => refresh_battery(&state),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if !refresh_battery(&state, dpi_target.as_ref()) {
+                    dpi_target = None;
+                }
+            }
         }
         notify();
     }
 }
 
-fn refresh_all(state: &Mutex<AppState>) {
+fn refresh_all(state: &Mutex<AppState>) -> Option<device::ValidatedDpiTarget> {
     let result = device::scan(ScanOptions {
         read_battery: true,
         read_dpi: true,
     });
+    let target = result
+        .as_ref()
+        .ok()
+        .and_then(|interfaces| device::validated_dpi_target(interfaces));
     if let Ok(mut current) = state.lock() {
-        match result {
-            Ok(interfaces) => current.replace_from_scan(&interfaces),
+        match &result {
+            Ok(interfaces) => current.replace_from_scan(interfaces),
             Err(_) => {
                 let settings = current.settings();
                 let mut replacement = AppState::default();
@@ -89,9 +131,14 @@ fn refresh_all(state: &Mutex<AppState>) {
             }
         }
     }
+    target.filter(|_| {
+        state
+            .lock()
+            .is_ok_and(|current| current.status == DeviceStatus::Single)
+    })
 }
 
-fn refresh_battery(state: &Mutex<AppState>) {
+fn refresh_battery(state: &Mutex<AppState>, target: Option<&device::ValidatedDpiTarget>) -> bool {
     let Ok(interfaces) = device::scan(ScanOptions {
         read_battery: true,
         read_dpi: false,
@@ -106,9 +153,47 @@ fn refresh_battery(state: &Mutex<AppState>) {
             replacement.settings_notice = notice;
             *current = replacement;
         }
-        return;
+        return false;
     };
+    let target_matches =
+        target.is_some_and(|target| device::validated_target_matches_scan(target, &interfaces));
     if let Ok(mut current) = state.lock() {
         current.apply_battery_scan(&interfaces);
+        target_matches && current.status == DeviceStatus::Single
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_target_uses_full_preflight_and_valid_target_uses_fast_path() {
+        assert_eq!(
+            dpi_write_route(DeviceStatus::Single, false),
+            DpiWriteRoute::FullPreflight
+        );
+        assert_eq!(
+            dpi_write_route(DeviceStatus::Single, true),
+            DpiWriteRoute::Fast
+        );
+        assert_eq!(
+            dpi_write_route(DeviceStatus::Unavailable, false),
+            DpiWriteRoute::FullPreflight
+        );
+    }
+
+    #[test]
+    fn multiple_devices_never_use_fast_path() {
+        assert_eq!(
+            dpi_write_route(DeviceStatus::MultipleDevices, true),
+            DpiWriteRoute::Blocked
+        );
+        assert_eq!(
+            dpi_write_route(DeviceStatus::MultipleDevices, false),
+            DpiWriteRoute::Blocked
+        );
     }
 }
