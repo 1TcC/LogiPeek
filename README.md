@@ -51,6 +51,24 @@ The tray command path was also exercised on this setup. Startup reported 41% bat
 
 HID++ is shared transport traffic. Replies can be stale or belong to another application; rotating software IDs reduces collisions but does not make them exclusive. Close Logitech software and retry if diagnostics are inconsistent.
 
+## Installation
+
+Download `LogiPeek-0.1.0-x64-Setup.exe` from [GitHub Releases](https://github.com/1TcC/LogiPeek/releases). The installer is the recommended option for Windows x64. It installs for the current user in `%LOCALAPPDATA%\Programs\LogiPeek` without an administrator prompt. It creates a Start Menu shortcut; the desktop shortcut is optional and off by default. Choose English or Simplified Chinese for the installer independently of LogiPeek's first-run language picker.
+
+This release is currently unsigned, so Windows SmartScreen may display a warning. Check the published SHA256 hash before running a download. Compatibility still depends on the particular Logitech device and connection.
+
+## Portable
+
+Download `LogiPeek-0.1.0-x64-portable.zip`, verify its SHA256 hash, extract it, and run `logipeek.exe`. The ZIP includes the license and both READMEs. It requires no installation; settings still live in `%LOCALAPPDATA%\LogiPeek\settings.ini`.
+
+## Uninstallation
+
+Use Windows Installed apps to uninstall LogiPeek. This removes the program files, shortcuts, uninstall entry, and only LogiPeek's Start with Windows Run value. It keeps `%LOCALAPPDATA%\LogiPeek\settings.ini` by default so a later installation can restore your settings.
+
+## Updating
+
+LogiPeek does not include automatic updates or runtime version checks. Visit [GitHub Releases](https://github.com/1TcC/LogiPeek/releases) when you want a newer version, then run its installer over the existing installation. Your settings, presets, theme, language, and Start with Windows choice remain in place.
+
 ## Build
 
 Install the Rust stable MSVC toolchain and the Windows SDK/Build Tools. From a Developer PowerShell, or another shell where the MSVC linker is available:

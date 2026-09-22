@@ -51,6 +51,24 @@ LogiPeek 可能将同一物理设备显示为多个接口，并且刻意不对�
 
 HID++ 传输可能被其他软件同时使用。回复可能陈旧，或来自其他应用；轮换 software ID 可降低冲突，但并不独占。若诊断结果不一致，请关闭 Logitech 软件后重试。
 
+## 安装
+
+从 [GitHub Releases](https://github.com/1TcC/LogiPeek/releases) 下载 `LogiPeek-0.1.0-x64-Setup.exe`。Windows x64 推荐使用安装包。安装器无需管理员权限，默认安装到 `%LOCALAPPDATA%\Programs\LogiPeek`。开始菜单快捷方式会自动创建；桌面快捷方式可选，默认不勾选。安装器的英文或简体中文选择与 LogiPeek 首次启动时的语言选择相互独立。
+
+本版本目前没有代码签名，因此 Windows SmartScreen 可能显示警告。运行下载文件前，请核对发布的 SHA256 值。实际兼容性仍取决于具体 Logitech 设备及连接方式。
+
+## 便携版
+
+下载 `LogiPeek-0.1.0-x64-portable.zip`，核对 SHA256 后解压并直接运行 `logipeek.exe`。压缩包包含许可证和中英文 README，无需安装；设置仍保存在 `%LOCALAPPDATA%\LogiPeek\settings.ini`。
+
+## 卸载
+
+通过 Windows“已安装的应用”卸载。卸载会移除程序文件、快捷方式、卸载记录，以及“开机启动”注册表中仅属于 LogiPeek 的值。默认保留 `%LOCALAPPDATA%\LogiPeek\settings.ini`，方便重新安装后恢复设置。
+
+## 更新
+
+LogiPeek 没有自动更新或运行时版本检查。需要新版时访问 [GitHub Releases](https://github.com/1TcC/LogiPeek/releases)，在现有安装上运行新版安装器。设置、preset、主题、语言和“开机启动”状态会保留。
+
 ## 构建
 
 安装 Rust stable MSVC toolchain、Windows SDK 和 Build Tools，然后在 Developer PowerShell 或 MSVC linker 可用的环境中执行：
